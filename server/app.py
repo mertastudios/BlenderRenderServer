@@ -1,36 +1,39 @@
 """Der Render-Server (FastAPI).
 
 Endpunkte (Uebersicht, alle aus Roblox per HttpService nutzbar):
-  GET  /                          -> kleine Status-Webseite (fuer den Browser)
-  GET  /health                    -> {"status":"ok", ...}
-  POST /jobs                      -> neuen Auftrag anlegen {"username": "..."}
-  GET  /jobs/current              -> Status des aktuellen/letzten Auftrags
+  GET  /                          -> Status-Webseite mit Live-Vorschau & Update-Status
+  GET  /health                    -> {"status":"ok", "version": ..., "update_available": ...}
+  POST /jobs                      -> neuen Auftrag anlegen {"username": "...", "avatar_data": ...}
+  GET  /jobs/current              -> Status des aktuellen Auftrags inkl. Schritt & Restzeit
   GET  /jobs/{id}                 -> Status eines bestimmten Auftrags
-  GET  /jobs/{id}/image/info      -> {width, height} (erst wenn fertig)
+  GET  /jobs/{id}/image/info      -> {width, height} (sobald fertig)
   GET  /jobs/{id}/image/rows?y=.. -> rohe RGBA-Pixelzeilen (application/octet-stream)
   GET  /jobs/{id}/image.png       -> fertiges Bild als PNG (Browser/Vorschau)
-
-Es wird immer nur EIN Auftrag gleichzeitig bearbeitet; maximal EIN weiterer
-Auftrag wartet in der Warteschlange ("queued").
+  GET  /update/status             -> Update-Status (Version, verfuegbare Updates)
+  POST /update                    -> Prueft auf Updates, installiert sie und startet neu
+  POST /update/restart            -> Veranlasst einen sauberen Server-Neustart
 """
 from __future__ import annotations
 
+import os
+import sys
 import threading
 import time
 import uuid
 from pathlib import Path
+from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from contextlib import asynccontextmanager
+
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from PIL import Image
 from pydantic import BaseModel
 
 from . import avatar, blender_runner, config, diagnostics, tunnel, updater
 
-app = FastAPI(title="BlenderRenderServer", version="1.1")
-
-# Pfade, die ohne Token erreichbar bleiben (Statusseite, Health, Diagnose).
-_OPEN_PATHS = {"/", "/health", "/diagnostics", "/favicon.ico"}
+# Pfade, die ohne Token erreichbar bleiben
+_OPEN_PATHS = {"/", "/health", "/diagnostics", "/favicon.ico", "/update/status", "/update"}
 
 
 def _request_token(request: Request) -> str:
@@ -43,244 +46,8 @@ def _request_token(request: Request) -> str:
     return (request.query_params.get("token") or "").strip()
 
 
-@app.middleware("http")
-async def _protect_jobs(request: Request, call_next):
-    expected = config.BRS_ACCESS_TOKEN
-    if not expected:
-        return await call_next(request)
-    path = request.url.path
-    if path in _OPEN_PATHS or path.startswith("/docs") or path.startswith("/openapi"):
-        return await call_next(request)
-    if _request_token(request) != expected:
-        return JSONResponse(
-            {
-                "detail": (
-                    "Ungueltiger oder fehlender Zugangstoken. "
-                    "Im Lua-Skript RENDER_ACCESS_TOKEN auf denselben Wert "
-                    "setzen wie BRS_ACCESS_TOKEN in der .env."
-                )
-            },
-            status_code=401,
-        )
-    return await call_next(request)
-
-ACTIVE_STATES = {"queued", "downloading", "loading", "rendering", "encoding"}
-STATE_LABELS = {
-    "queued": "Auftrag in der Warteschlange",
-    "downloading": "Avatar wird von Roblox heruntergeladen",
-    "loading": "3D-Modell wird in Blender geladen",
-    "rendering": "Blender Cycles rendert",
-    "encoding": "Bild wird fuer die Uebertragung vorbereitet",
-    "done": "Fertig",
-    "error": "Fehler",
-}
-
-
-class JobBody(BaseModel):
-    username: str
-
-
-class JobManager:
-    def __init__(self) -> None:
-        self.lock = threading.Lock()
-        self.jobs: dict[str, dict] = {}
-        self.order: list[str] = []
-        self.current_id: str | None = None
-        self.pending_id: str | None = None
-
-    # ------------------------------------------------------------- Hilfen
-    @staticmethod
-    def _job_dir(job_id: str) -> Path:
-        return config.ROOT / "data" / "jobs" / job_id
-
-    def _set(self, job: dict, state: str, message: str = "") -> None:
-        job["state"] = state
-        job["message"] = message or STATE_LABELS.get(state, state)
-        job["updated_at"] = time.time()
-        print(f"[Job {job['id'][:8]}] {state}: {job['message']}", flush=True)
-
-    def active(self) -> bool:
-        job = self.jobs.get(self.current_id or "")
-        return bool(job and job["state"] in ACTIVE_STATES)
-
-    def get(self, job_id: str) -> dict | None:
-        return self.jobs.get(job_id)
-
-    def current(self) -> dict | None:
-        return self.jobs.get(self.current_id or "") or self.jobs.get(self.pending_id or "")
-
-    # --------------------------------------------------------- Auftrag anlegen
-    def submit(self, username: str) -> dict:
-        username = username.strip()
-        with self.lock:
-            if self.active():
-                # Es laeuft schon etwas -> hoechstens EINEN wartenden Auftrag ersetzen
-                if self.pending_id and self.pending_id in self.jobs:
-                    old = self.jobs[self.pending_id]
-                    if old["state"] == "queued":
-                        old["state"] = "superseded"
-                job_id = uuid.uuid4().hex[:12]
-                job = self._new_job(job_id, username)
-                self.pending_id = job_id
-                self._set(job, "queued", "Auftrag wartet (nur ein Auftrag gleichzeitig)")
-                return job
-            job_id = uuid.uuid4().hex[:12]
-            job = self._new_job(job_id, username)
-            self.current_id = job_id
-            self.pending_id = None
-            self._start_worker()
-            return job
-
-    def _new_job(self, job_id: str, username: str) -> dict:
-        job_dir = self._job_dir(job_id)
-        job_dir.mkdir(parents=True, exist_ok=True)
-        job = {
-            "id": job_id,
-            "username": username,
-            "state": "queued",
-            "message": "Auftrag angelegt",
-            "progress": 0,
-            "error": None,
-            "created_at": time.time(),
-            "updated_at": time.time(),
-            "dir": str(job_dir),
-            "width": None,
-            "height": None,
-            "rgba_path": None,
-        }
-        self.jobs[job_id] = job
-        self.order.append(job_id)
-        self._cleanup_old()
-        return job
-
-    def _cleanup_old(self) -> None:
-        while len(self.order) > 6:
-            old_id = self.order.pop(0)
-            old = self.jobs.pop(old_id, None)
-            if old and old.get("state") not in ACTIVE_STATES:
-                try:
-                    import shutil
-
-                    shutil.rmtree(old["dir"], ignore_errors=True)
-                except Exception:
-                    pass
-            elif old:
-                self.order.insert(0, old_id)
-                break
-
-    # --------------------------------------------------------------- Worker
-    def _start_worker(self) -> None:
-        thread = threading.Thread(target=self._worker, daemon=True, name="brs-worker")
-        thread.start()
-
-    def _worker(self) -> None:
-        while True:
-            with self.lock:
-                if not self.active() and self.pending_id:
-                    self.current_id = self.pending_id
-                    self.pending_id = None
-                job = self.jobs.get(self.current_id or "")
-                if not job or job["state"] not in ACTIVE_STATES:
-                    return
-            self._run_job(job)
-
-    def _run_job(self, job: dict) -> None:
-        job_dir = Path(job["dir"])
-        try:
-            # Phase 1: Avatar laden ------------------------------------------------
-            self._set(job, "downloading", f"Avatar von '{job['username']}' wird geladen ...")
-            job["progress"] = 4
-            model_dir = job_dir / "model"
-            if config.TEST_MODE:
-                info = avatar.make_test_model(model_dir)
-            else:
-                info = avatar.download_avatar_model(job["username"], model_dir)
-            job["avatar_info"] = info
-            self._set(job, "loading", "3D-Modell wird in Blender geladen (Glas-Material) ...")
-            job["progress"] = 12
-
-            # Phase 2: Rendern ------------------------------------------------------
-            def progress(stage: str, frac: float | None):
-                base = {"loading": 12, "rendering": 20, "encoding": 96}.get(stage, 20)
-                span = {"loading": 8, "rendering": 76, "encoding": 4}.get(stage, 0)
-                if frac is None:
-                    job["progress"] = base
-                else:
-                    job["progress"] = min(99, int(base + span * max(0.0, min(1.0, frac))))
-                if stage == "rendering":
-                    job["message"] = f"Blender Cycles rendert ... {job['progress']}%"
-
-            png_path = job_dir / "render.png"
-            blender_runner.render(model_dir, png_path, progress=progress)
-
-            # Phase 3: In RGBA-Pixel umwandeln (fuer EditableImage) ----------------
-            self._set(job, "encoding", "Bild wird fuer die Uebertragung vorbereitet ...")
-            img = Image.open(png_path).convert("RGBA")
-            if img.width > 1024 or img.height > 1024:
-                img = img.resize((1024, 1024), Image.LANCZOS)
-            rgba_path = job_dir / "render.rgba"
-            rgba_path.write_bytes(img.tobytes())
-            job["width"] = img.width
-            job["height"] = img.height
-            job["rgba_path"] = str(rgba_path)
-
-            self._set(job, "done", f"Fertig! ({img.width}x{img.height} Pixel)")
-            job["progress"] = 100
-        except Exception as exc:  # noqa: BLE001
-            job["error"] = str(exc)
-            self._set(job, "error", str(exc))
-
-    # ----------------------------------------------------------- Status-JSON
-    def payload(self, job: dict | None) -> dict:
-        if not job:
-            return {"state": "idle", "message": "Server ist bereit - kein Auftrag aktiv."}
-        queued = []
-        if self.pending_id and self.pending_id in self.jobs:
-            pending = self.jobs[self.pending_id]
-            queued = [{"job_id": pending["id"], "username": pending["username"]}]
-        out = {
-            "job_id": job["id"],
-            "username": job["username"],
-            "state": job["state"],
-            "message": job.get("message", job["state"]),
-            "progress": job.get("progress", 0),
-            "error": job.get("error"),
-            "queued": queued,
-        }
-        if job.get("width"):
-            out["image"] = {"width": job["width"], "height": job["height"]}
-        return out
-
-
-MANAGER = JobManager()
-
-
-# ------------------------------------------------------------------------------
-#  Hintergrund-Update-Thread
-# ------------------------------------------------------------------------------
-
-def _update_loop() -> None:
-    while True:
-        time.sleep(config.AUTO_UPDATE_CHECK_SECONDS)
-        if not config.AUTO_UPDATE:
-            continue
-        # Nur updaten, wenn gerade kein Auftrag laeuft
-        if MANAGER.active():
-            continue
-        try:
-            updated, msg = updater.check_and_apply()
-            print(f"[Update] {msg}", flush=True)
-            if updated:
-                import os
-
-                print("[Update] Neustart des Servers ...", flush=True)
-                os._exit(77)  # Watchdog (run.py) startet automatisch neu
-        except Exception as exc:  # noqa: BLE001
-            print(f"[Update] Fehler beim Update-Check: {exc}", flush=True)
-
-
-@app.on_event("startup")
-def _on_startup() -> None:
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     config.ensure_dirs()
     print("=" * 62, flush=True)
     print(f"  BlenderRenderServer ist ONLINE  (Version {config.version()})", flush=True)
@@ -309,6 +76,290 @@ def _on_startup() -> None:
             print(f"[Tunnel] Konnte nicht starten: {exc}", flush=True)
     if config.AUTO_UPDATE:
         threading.Thread(target=_update_loop, daemon=True, name="brs-updater").start()
+    yield
+
+
+app = FastAPI(title="BlenderRenderServer", version="1.2", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def _protect_jobs(request: Request, call_next):
+    expected = config.BRS_ACCESS_TOKEN
+    if not expected:
+        return await call_next(request)
+    path = request.url.path
+    if path in _OPEN_PATHS or path.startswith("/docs") or path.startswith("/openapi"):
+        return await call_next(request)
+    if _request_token(request) != expected:
+        return JSONResponse(
+            {
+                "detail": (
+                    "Ungueltiger oder fehlender Zugangstoken. "
+                    "Im Lua-Skript RENDER_ACCESS_TOKEN auf denselben Wert "
+                    "setzen wie BRS_ACCESS_TOKEN in der .env."
+                )
+            },
+            status_code=401,
+        )
+    return await call_next(request)
+
+
+ACTIVE_STATES = {"queued", "downloading", "loading", "rendering", "encoding"}
+STATE_STEPS = {
+    "queued": (1, 5, "Auftrag in Warteschlange"),
+    "downloading": (2, 5, "Avatar-Koerperteile & Texturen laden"),
+    "loading": (3, 5, "3D-Rig & Materialien in Blender vorbereiten"),
+    "rendering": (4, 5, "Blender Cycles High-End Rendern"),
+    "encoding": (5, 5, "Bild fuer Uebertragung vorbereiten"),
+    "done": (5, 5, "Fertig gerendert"),
+    "error": (0, 5, "Fehler"),
+}
+
+
+class JobBody(BaseModel):
+    username: str
+    avatar_data: Optional[Dict[str, Any]] = None
+
+
+def trigger_restart() -> None:
+    """Startet den Server-Prozess sauber neu."""
+    print("[Server] Neustart wird ausgeloest ...", flush=True)
+    time.sleep(0.5)
+    # Exit-Code 77 signalisiert dem Watchdog (run.py) den automatischen Neustart
+    os._exit(77)
+
+
+class JobManager:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.jobs: dict[str, dict] = {}
+        self.order: list[str] = []
+        self.current_id: str | None = None
+        self.pending_id: str | None = None
+
+    # ------------------------------------------------------------- Hilfen
+    @staticmethod
+    def _job_dir(job_id: str) -> Path:
+        return config.ROOT / "data" / "jobs" / job_id
+
+    def _set(self, job: dict, state: str, message: str = "", step: Optional[int] = None,
+             est_seconds_left: Optional[int] = None) -> None:
+        job["state"] = state
+        step_num, step_total, default_name = STATE_STEPS.get(state, (1, 5, state))
+        job["step"] = step if step is not None else step_num
+        job["step_total"] = step_total
+        job["step_name"] = default_name
+        if est_seconds_left is not None:
+            job["est_seconds_left"] = est_seconds_left
+        job["message"] = message or default_name
+        job["updated_at"] = time.time()
+        print(f"[Job {job['id'][:8]}] Schritt {job['step']}/{job['step_total']} ({state}): {job['message']}", flush=True)
+
+    def active(self) -> bool:
+        job = self.jobs.get(self.current_id or "")
+        return bool(job and job["state"] in ACTIVE_STATES)
+
+    def get(self, job_id: str) -> dict | None:
+        return self.jobs.get(job_id)
+
+    def current(self) -> dict | None:
+        return self.jobs.get(self.current_id or "") or self.jobs.get(self.pending_id or "")
+
+    # --------------------------------------------------------- Auftrag anlegen
+    def submit(self, username: str, avatar_data: Optional[Dict[str, Any]] = None) -> dict:
+        username = username.strip()
+        with self.lock:
+            if self.active():
+                if self.pending_id and self.pending_id in self.jobs:
+                    old = self.jobs[self.pending_id]
+                    if old["state"] == "queued":
+                        old["state"] = "superseded"
+                job_id = uuid.uuid4().hex[:12]
+                job = self._new_job(job_id, username, avatar_data)
+                self.pending_id = job_id
+                self._set(job, "queued", "Auftrag wartet (nur ein Auftrag gleichzeitig)", est_seconds_left=35)
+                return job
+            job_id = uuid.uuid4().hex[:12]
+            job = self._new_job(job_id, username, avatar_data)
+            self.current_id = job_id
+            self.pending_id = None
+            self._start_worker()
+            return job
+
+    def _new_job(self, job_id: str, username: str, avatar_data: Optional[Dict[str, Any]] = None) -> dict:
+        job_dir = self._job_dir(job_id)
+        job_dir.mkdir(parents=True, exist_ok=True)
+        job = {
+            "id": job_id,
+            "username": username,
+            "avatar_data": avatar_data,
+            "state": "queued",
+            "message": "Auftrag angelegt",
+            "progress": 0,
+            "step": 1,
+            "step_total": 5,
+            "step_name": "Initialisierung",
+            "est_seconds_left": 30,
+            "error": None,
+            "created_at": time.time(),
+            "updated_at": time.time(),
+            "dir": str(job_dir),
+            "width": None,
+            "height": None,
+            "rgba_path": None,
+        }
+        self.jobs[job_id] = job
+        self.order.append(job_id)
+        self._cleanup_old()
+        return job
+
+    def _cleanup_old(self) -> None:
+        while len(self.order) > 6:
+            old_id = self.order.pop(0)
+            old = self.jobs.pop(old_id, None)
+            if old and old.get("state") not in ACTIVE_STATES:
+                try:
+                    import shutil
+                    shutil.rmtree(old["dir"], ignore_errors=True)
+                except Exception:
+                    pass
+            elif old:
+                self.order.insert(0, old_id)
+                break
+
+    # --------------------------------------------------------------- Worker
+    def _start_worker(self) -> None:
+        thread = threading.Thread(target=self._worker, daemon=True, name="brs-worker")
+        thread.start()
+
+    def _worker(self) -> None:
+        while True:
+            with self.lock:
+                if not self.active() and self.pending_id:
+                    self.current_id = self.pending_id
+                    self.pending_id = None
+                job = self.jobs.get(self.current_id or "")
+                if not job or job["state"] not in ACTIVE_STATES:
+                    return
+            self._run_job(job)
+
+    def _run_job(self, job: dict) -> None:
+        job_dir = Path(job["dir"])
+        render_start_time = 0.0
+        try:
+            # Schritt 2: Avatar & Koerperteile herunterladen -------------------------
+            self._set(job, "downloading", f"Avatar '{job['username']}' wird von Roblox geladen ...", est_seconds_left=28)
+            job["progress"] = 10
+            model_dir = job_dir / "model"
+
+            if config.TEST_MODE:
+                info = avatar.make_test_model(model_dir)
+            else:
+                info = avatar.download_avatar_model(job["username"], model_dir, avatar_data=job.get("avatar_data"))
+            job["avatar_info"] = info
+
+            # Schritt 3: Rig & Materialien in Blender aufbauen -----------------------
+            self._set(job, "loading", "3D-Avatar wird geriggt & Knochenskelett aufgebaut ...", est_seconds_left=22)
+            job["progress"] = 25
+
+            # Schritt 4: Blender Cycles Rendern -------------------------------------
+            render_start_time = time.time()
+
+            def progress(stage: str, frac: float | None):
+                if stage == "loading":
+                    job["progress"] = min(28, int(20 + 8 * (frac or 0.0)))
+                elif stage == "rendering":
+                    f = max(0.0, min(1.0, frac if frac is not None else 0.0))
+                    job["progress"] = min(94, int(30 + 64 * f))
+                    elapsed = time.time() - render_start_time
+                    if f > 0.05:
+                        total_est = elapsed / f
+                        remaining = max(1, int(total_est - elapsed))
+                        job["est_seconds_left"] = remaining + 2
+                    else:
+                        job["est_seconds_left"] = 18
+                    job["message"] = f"Blender Cycles rendert ... {job['progress']}% (ca. {job['est_seconds_left']} s)"
+                elif stage == "encoding":
+                    job["progress"] = 96
+                    job["est_seconds_left"] = 2
+
+            png_path = job_dir / "render.png"
+            blender_runner.render(model_dir, png_path, progress=progress)
+
+            # Schritt 5: RGBA Pixel vorbereiten (fuer EditableImage) -----------------
+            self._set(job, "encoding", "Bild wird fuer die Uebertragung vorbereitet ...", est_seconds_left=2)
+            job["progress"] = 96
+
+            img = Image.open(png_path).convert("RGBA")
+            if img.width > 1024 or img.height > 1024:
+                img = img.resize((1024, 1024), Image.LANCZOS)
+            rgba_path = job_dir / "render.rgba"
+            rgba_path.write_bytes(img.tobytes())
+            job["width"] = img.width
+            job["height"] = img.height
+            job["rgba_path"] = str(rgba_path)
+
+            self._set(job, "done", f"Fertig! ({img.width}x{img.height} Pixel gerendert)", est_seconds_left=0)
+            job["progress"] = 100
+        except Exception as exc:  # noqa: BLE001
+            job["error"] = str(exc)
+            self._set(job, "error", str(exc), est_seconds_left=0)
+
+    # ----------------------------------------------------------- Status-JSON
+    def payload(self, job: dict | None) -> dict:
+        if not job:
+            return {
+                "state": "idle",
+                "message": "Server ist bereit - kein Auftrag aktiv.",
+                "progress": 0,
+                "step": 0,
+                "step_total": 5,
+                "est_seconds_left": 0,
+            }
+        queued = []
+        if self.pending_id and self.pending_id in self.jobs:
+            pending = self.jobs[self.pending_id]
+            queued = [{"job_id": pending["id"], "username": pending["username"]}]
+        out = {
+            "job_id": job["id"],
+            "username": job["username"],
+            "state": job["state"],
+            "message": job.get("message", job["state"]),
+            "progress": job.get("progress", 0),
+            "step": job.get("step", 1),
+            "step_total": job.get("step_total", 5),
+            "step_name": job.get("step_name", ""),
+            "est_seconds_left": job.get("est_seconds_left", 0),
+            "error": job.get("error"),
+            "queued": queued,
+        }
+        if job.get("width"):
+            out["image"] = {"width": job["width"], "height": job["height"]}
+        return out
+
+
+MANAGER = JobManager()
+
+
+# ------------------------------------------------------------------------------
+#  Hintergrund-Update-Thread
+# ------------------------------------------------------------------------------
+
+def _update_loop() -> None:
+    while True:
+        time.sleep(config.AUTO_UPDATE_CHECK_SECONDS)
+        if not config.AUTO_UPDATE:
+            continue
+        if MANAGER.active():
+            continue
+        try:
+            updated, msg = updater.check_and_apply()
+            print(f"[Update] {msg}", flush=True)
+            if updated:
+                print("[Update] Neustart des Servers wird eingeleitet ...", flush=True)
+                trigger_restart()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[Update] Fehler beim Update-Check: {exc}", flush=True)
 
 
 # ------------------------------------------------------------------------------
@@ -318,9 +369,12 @@ def _on_startup() -> None:
 @app.get("/health")
 def health() -> dict:
     pub = tunnel.public_url()
+    up_status = updater.get_status()
     return {
         "status": "ok",
         "version": config.version(),
+        "update_available": up_status.get("update_available", False),
+        "remote_version": up_status.get("remote_version", "unbekannt"),
         "blender": blender_runner.blender_available(),
         "test_mode": config.TEST_MODE,
         "api_key_set": bool(config.ROBLOX_API_KEY),
@@ -329,6 +383,29 @@ def health() -> dict:
         "public_url": pub or None,
         "current_state": (MANAGER.current() or {}).get("state", "idle"),
     }
+
+
+@app.get("/update/status")
+def update_status() -> dict:
+    return updater.get_status()
+
+
+@app.post("/update")
+def perform_update(background_tasks: BackgroundTasks) -> dict:
+    updated, msg = updater.check_and_apply(force=False)
+    if updated:
+        background_tasks.add_task(trigger_restart)
+    return {
+        "updated": updated,
+        "message": msg,
+        "restarting": updated,
+    }
+
+
+@app.post("/update/restart")
+def restart_endpoint(background_tasks: BackgroundTasks) -> dict:
+    background_tasks.add_task(trigger_restart)
+    return {"status": "ok", "message": "Server wird neu gestartet ..."}
 
 
 @app.get("/diagnostics")
@@ -351,7 +428,7 @@ def create_job(body: JobBody) -> dict:
         ch.isalnum() or ch == "_" for ch in username
     ):
         raise HTTPException(400, "Ungueltiger Roblox-Benutzername (3-20 Zeichen, A-Z, 0-9, _).")
-    job = MANAGER.submit(username)
+    job = MANAGER.submit(username, avatar_data=body.avatar_data)
     return MANAGER.payload(job)
 
 
@@ -445,6 +522,10 @@ def index() -> str:
     msg = payload.get("message", "")
     job_id = payload.get("job_id", "")
     progress = payload.get("progress", 0)
+    step = payload.get("step", 0)
+    step_total = payload.get("step_total", 5)
+    est_sec = payload.get("est_seconds_left", 0)
+
     img = ""
     if state == "done" and job_id:
         img = f'<img src="/jobs/{job_id}/image.png" alt="Render">' \
@@ -455,39 +536,43 @@ def index() -> str:
     if not config.TEST_MODE and not config.ROBLOX_API_KEY:
         warn += (
             '<p class="warn">Kein ROBLOX_API_KEY gesetzt. Seit Maerz 2026 braucht der '
-            "3D-Avatar-Download (OBJ + Texturen, kein Profilbild) einen Open-Cloud-Key "
-            "mit Recht <code>thumbnails: Read</code>. Siehe ANLEITUNG.md Abschnitt 9.</p>"
+            "3D-Avatar-Download einen Open-Cloud-Key mit Recht <code>thumbnails: Read</code>. "
+            "Siehe ANLEITUNG.md Abschnitt 9.</p>"
         )
     if pub:
         warn += f'<p class="info">Oeffentliche URL fuer Live-Spiele: <code>{pub}</code></p>'
-    else:
-        warn += (
-            '<p class="info">Studio: <code>http://localhost:'
-            f"{config.PORT}</code> &nbsp;|&nbsp; Veroeffentlichtes Spiel: "
-            "<code>08_oeffentliche_adresse.bat</code> starten und die https-URL "
-            "im Lua-Skript eintragen.</p>"
-        )
+
+    step_info = f"<p style='color:#a0aec0;font-size:0.95rem;margin-top:8px'>Schritt {step} von {step_total} &bull; Restzeit: ~{est_sec} s</p>" if state in ACTIVE_STATES else ""
+
     return f"""<!doctype html><html lang="de"><head><meta charset="utf-8">
-<meta http-equiv="refresh" content="5"><title>Blender Render Server</title>
-<style>body{{font-family:system-ui,Segoe UI,Arial;background:#14161a;color:#eee;
+<meta http-equiv="refresh" content="3"><title>Blender Render Server</title>
+<style>body{{font-family:system-ui,Segoe UI,Arial;background:#121418;color:#eee;
 display:flex;flex-direction:column;align-items:center;padding:40px}}
-h1{{font-size:1.6rem}} .box{{background:#1f232b;border-radius:12px;padding:24px 32px;
-max-width:640px;text-align:center}} .state{{color:{color};font-size:1.3rem;font-weight:600}}
-.bar{{height:10px;background:#2b313c;border-radius:6px;margin:16px 0;overflow:hidden}}
-.fill{{height:100%;width:{progress}%;background:linear-gradient(90deg,#3498db,#2ecc71)}} img{{max-width:100%;
-border-radius:8px}} a{{color:#3498db}}
+h1{{font-size:1.6rem}} .box{{background:#1b1f27;border-radius:14px;padding:24px 32px;
+max-width:640px;text-align:center;box-shadow:0 8px 24px rgba(0,0,0,0.4)}} .state{{color:{color};font-size:1.3rem;font-weight:600}}
+.bar{{height:12px;background:#282e3b;border-radius:6px;margin:16px 0;overflow:hidden}}
+.fill{{height:100%;width:{progress}%;background:linear-gradient(90deg,#3b82f6,#10b981);transition:width 0.4s ease}} img{{max-width:100%;
+border-radius:8px}} a{{color:#3b82f6;text-decoration:none}} a:hover{{text-decoration:underline}}
 .warn{{background:#3a2424;color:#f5c2c2;padding:10px 12px;border-radius:8px;font-size:0.9rem;text-align:left}}
-.info{{background:#243044;color:#c5d4ea;padding:10px 12px;border-radius:8px;font-size:0.85rem;text-align:left}}
-code{{color:#9cdcfe}}</style></head><body>
-<h1>&#129482; Blender Render Server</h1>
+.info{{background:#1e293b;color:#93c5fd;padding:10px 12px;border-radius:8px;font-size:0.85rem;text-align:left}}
+.btn{{background:#2563eb;color:#fff;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:600}}
+.btn:hover{{background:#1d4ed8}}
+code{{color:#93c5fd}}</style></head><body>
+<h1>&#129482; Blender Render Server (Rigged Cycles)</h1>
 <div class="box">
-<p class="state">{state}</p><p>{msg}</p>
+<p class="state">{state.upper()}</p><p style="font-size:1.05rem">{msg}</p>
+{step_info}
 <div class="bar"><div class="fill"></div></div>
+<p style="color:#718096;font-size:0.85rem;margin-bottom:16px">{progress}% abgeschlossen</p>
 {warn}
 {img}
-<p style="color:#8892a4;font-size:0.85rem">Version {config.version()} &middot;
+<div style="margin-top:20px;border-top:1px solid #2d3748;padding-top:16px">
+<form method="post" action="/update" style="display:inline">
+<button class="btn" type="submit">&#128260; Auf Updates pr&uuml;fen &amp; Neustarten</button>
+</form>
+</div>
+<p style="color:#718096;font-size:0.85rem;margin-top:16px">Version {config.version()} &middot;
 Test-Modus: {'an' if config.TEST_MODE else 'aus'} &middot;
-API-Key: {'ja' if config.ROBLOX_API_KEY else 'fehlt'} &middot;
-<a href="/diagnostics">Verbindungscheck</a> &middot;
-Diese Seite aktualisiert sich alle 5 s selbst.</p>
+<a href="/diagnostics">Diagnose</a> &middot;
+Aktualisiert alle 3 s.</p>
 </div></body></html>"""

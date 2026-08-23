@@ -164,10 +164,13 @@ für deinen Windows-Benutzer.
   neuer Pull Request gemergt wurde).
 - Wenn ja: Die neuen Dateien werden automatisch heruntergeladen und installiert
   – **aber nur, wenn gerade kein Render-Auftrag läuft**. Der Server startet
-  danach selbst neu.
+  sich danach im laufenden Betrieb selbst neu und läuft sofort weiter.
+- Wenn du `02_start.bat` ausführst während der Server bereits läuft, prüft
+  er ebenfalls auf Updates, wendet sie an und veranlasst den Neustart.
 - Deine Einstellungen (`.env`), Blender-Installation, heruntergeladene Avatare
   und gerenderten Bilder bleiben dabei unberührt.
-- Manuell sofort updaten: `03_stop.bat` und dann `02_start.bat` ausführen.
+- Manuell im Browser updaten: Auf http://localhost:8000 gibt es einen Knopf
+  **„Auf Updates prüfen & Neustarten“**.
 
 ---
 
@@ -357,16 +360,16 @@ heißen `RenderServerService` / `RenderClient` und schreiben immer
 
 ## 14) Für Neugierige: Was passiert da technisch?
 
-1. Das Roblox-Server-Skript schickt `POST /jobs {"username":"..."}` an deinen PC.
-2. Der Server löst den Namen zur Roblox-UserId auf (users.roblox.com).
-3. Er holt das **3D-Thumbnail-Manifest** (thumbnails.roblox.com, Format
-   `avatar-3d`): das enthält OBJ-, Material- und Textur-Verweise.
-4. OBJ/MTL/Texturen werden vom Roblox-CDN in den Auftragordner geladen.
-5. Blender (headless) importiert das Modell, richtet es aus, setzt ein
-   physikalisches **Glas-Material** (Transmission 100 %, IOR 1.45, klarlack-
-   Beschichtung für schöne Reflexe), positioniert Kamera + Himmel + Lichter
+1. Das Roblox-Server-Skript schickt `POST /jobs {"username":"...", "avatar_data": ...}` an deinen PC.
+2. Der Server löst den Namen zur Roblox-UserId auf (users.roblox.com) oder nutzt die Studio-Rig-Daten.
+3. Er lädt alle **15 Körperteile (R15)** bzw. 6 Teile (R6), Accessoires und Texturen einzeln herunter.
+4. In Blender wird ein echtes **Knochenskelett (Armature)** aufgebaut und alle Körperteile
+   werden über Vertex-Gruppen an die jeweiligen Knochen gebunden. Der Avatar wird in die
+   unverformte **T-Pose (REST-Pose)** versetzt.
+5. Blender (headless) setzt ein physikalisches **Glas-Material** (Transmission 100 %, IOR 1.45,
+   Klarlack-Beschichtung für schöne Reflexe), positioniert Kamera + Himmel + Lichter
    automatisch und rendert mit **Cycles** (Denoising an).
 6. Das PNG wird in rohe RGBA-Pixel zerlegt. Roblox lädt es zeilenweise
    (`image/rows`) und schreibt es in ein **EditableImage** – und leitet dieselben
    Pakete per **RemoteEvent** an den Client weiter, der sein eigenes
-   EditableImage in einem GUI anzeigt.
+   EditableImage in einem modernen GUI anzeigt.

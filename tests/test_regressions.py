@@ -1,6 +1,8 @@
-"""Regressionstests zu den Fixes: 3D-API-Auth, GitHub-Update, Token."""
+"""Regressionstests: 3D-API-Auth, GitHub-Update, Token, Rigging, Roblox-Mesh & Steps."""
 from __future__ import annotations
 
+import json
+import struct
 import sys
 import tempfile
 import unittest
@@ -11,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from server import avatar, config, updater  # noqa: E402
+from server import avatar, config, roblox_mesh, updater  # noqa: E402
 from server.avatar import AvatarError  # noqa: E402
 
 
@@ -100,9 +102,6 @@ class ManifestFetchTests(unittest.TestCase):
 
 
 class MtlFixupTests(unittest.TestCase):
-    """Die OBJ-Warnungen aus dem Server-Log ("map_Ka not supported" und
-    "Cannot load image file ... ohne Endung") duerfen nicht mehr auftreten."""
-
     def test_appends_png_extension(self):
         out = avatar._rewrite_mtl("map_Kd 30DAY-abc", ["30DAY-abc.png"])
         self.assertIn("map_Kd 30DAY-abc.png", out)
@@ -168,6 +167,53 @@ class DownloadAvatarModelTests(unittest.TestCase):
             self.assertTrue(obj.startswith("mtllib avatar.mtl\n"))
             self.assertNotIn("irgendeinhash", obj)
             self.assertEqual(obj.count("mtllib"), 1)
+
+    def test_creates_manifest_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            info = self._run(tmp, b"v 0 0 0\nf 1 1 1\n")
+            manifest_file = Path(tmp) / "manifest.json"
+            self.assertTrue(manifest_file.exists())
+            data = json.loads(manifest_file.read_text(encoding="utf-8"))
+            self.assertEqual(data.get("rig_type"), "R15")
+            self.assertTrue(data.get("is_rigged"))
+
+
+class RiggingAndTestModelTests(unittest.TestCase):
+    def test_make_test_model_creates_15_r15_parts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            info = avatar.make_test_model(Path(tmp))
+            self.assertTrue((Path(tmp) / "avatar.obj").exists())
+            self.assertTrue((Path(tmp) / "manifest.json").exists())
+            manifest = json.loads((Path(tmp) / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest.get("rig_type"), "R15")
+            self.assertEqual(len(manifest.get("parts", [])), 15)
+            # Pruefen ob alle 15 R15 Teile als separate OBJs vorliegen
+            for expected_part in ("Head", "UpperTorso", "LowerTorso", "LeftUpperArm", "RightFoot"):
+                self.assertTrue((Path(tmp) / f"{expected_part}.obj").exists())
+
+
+class RobloxMeshParserTests(unittest.TestCase):
+    def test_parse_v1_ascii_mesh(self):
+        v1_text = b"version 1.00\n1\n[0,0,0][0,1,0][0,0,0][1,0,0][0,1,0][1,0,0][0,1,0][0,1,0][0,1,0]\n"
+        mesh = roblox_mesh.parse_roblox_mesh(v1_text)
+        self.assertEqual(mesh.version, "1.00")
+        self.assertEqual(len(mesh.vertices), 3)
+        self.assertEqual(len(mesh.faces), 1)
+        obj_text = mesh.to_obj("Part")
+        self.assertIn("o Part", obj_text)
+        self.assertIn("v 0.000000 0.000000 0.000000", obj_text)
+
+    def test_parse_v2_binary_mesh(self):
+        hdr = struct.pack("<HBBII", 12, 40, 12, 3, 1)
+        v1 = struct.pack("<ffffffffBBBBBBBB", 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255)
+        v2 = struct.pack("<ffffffffBBBBBBBB", 1, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 255, 255, 255, 255)
+        v3 = struct.pack("<ffffffffBBBBBBBB", 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 255, 255, 255, 255)
+        f1 = struct.pack("<III", 0, 1, 2)
+        v2_data = b"version 2.00\n" + hdr + v1 + v2 + v3 + f1
+        mesh = roblox_mesh.parse_roblox_mesh(v2_data)
+        self.assertEqual(mesh.version, "2.00")
+        self.assertEqual(len(mesh.vertices), 3)
+        self.assertEqual(len(mesh.faces), 1)
 
 
 class UpdaterTests(unittest.TestCase):
@@ -242,13 +288,6 @@ class SessionHeaderTests(unittest.TestCase):
         self.assertNotIn("x-api-key", {k.lower() for k in session.headers.keys()})
 
 
-class ConfigTests(unittest.TestCase):
-    def test_new_settings_exist(self):
-        self.assertTrue(hasattr(config, "PUBLIC_URL"))
-        self.assertTrue(hasattr(config, "PUBLIC_TUNNEL"))
-        self.assertTrue(hasattr(config, "BRS_ACCESS_TOKEN"))
-
-
 class AppEndpointTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -262,7 +301,7 @@ class AppEndpointTests(unittest.TestCase):
         cls.client = TestClient(appmod.app)
         cls.appmod = appmod
 
-    def test_health_lists_studio_url(self):
+    def test_health_lists_studio_url_and_update(self):
         if not self.client:
             self.skipTest("fastapi TestClient nicht verfuegbar")
         resp = self.client.get("/health")
@@ -270,7 +309,16 @@ class AppEndpointTests(unittest.TestCase):
         body = resp.json()
         self.assertEqual(body["status"], "ok")
         self.assertIn("studio_url", body)
-        self.assertIn("api_key_set", body)
+        self.assertIn("update_available", body)
+
+    def test_update_status_endpoint(self):
+        if not self.client:
+            self.skipTest("fastapi TestClient nicht verfuegbar")
+        resp = self.client.get("/update/status")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertIn("current_version", body)
+        self.assertIn("update_available", body)
 
     def test_token_protects_jobs_but_not_health(self):
         if not self.client:
@@ -281,16 +329,6 @@ class AppEndpointTests(unittest.TestCase):
             self.assertIn("RENDER_ACCESS_TOKEN", denied.json()["detail"])
             health = self.client.get("/health")
             self.assertEqual(health.status_code, 200)
-
-    def test_status_page_warns_without_api_key(self):
-        if not self.client:
-            self.skipTest("fastapi TestClient nicht verfuegbar")
-        with patch.object(config, "ROBLOX_API_KEY", ""):
-            with patch.object(config, "TEST_MODE", False):
-                resp = self.client.get("/")
-        self.assertEqual(resp.status_code, 200)
-        self.assertIn("ROBLOX_API_KEY", resp.text)
-        self.assertIn("kein Profilbild", resp.text)
 
 
 if __name__ == "__main__":

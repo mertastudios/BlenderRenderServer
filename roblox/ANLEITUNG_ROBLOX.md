@@ -65,37 +65,34 @@ eingerichtet sein und laufen (siehe `ANLEITUNG.md` im Hauptordner).
    schwarzes Fenster mit „ist ONLINE“).
 2. In Studio oben auf **Play** drücken.
 3. Öffne die Konsole: **View** → **Output** (Ausgabe).
-4. Du siehst jetzt ungefähr sowas (Reihenfolge kann leicht abweichen):
+4. Du siehst jetzt die genauen Schritte mit Fortschritt und Restzeit:
 
 ```
-[BlenderRender] Server-Skript geladen!
-[BlenderRender] Render-Server : http://localhost:8000
-[BlenderRender] Avatar-User   : DeinRobloxName
+[BlenderRender] Server-Skript initialisiert!
+[BlenderRender] Server-Adresse: http://localhost:8000
+[BlenderRender] Standard-User : DeinRobloxName
 ==============================================================
-[BlenderRender] 🔴 SERVER DOWN – keine Verbindung ...   ← nur, wenn der Server AUS ist
-[BlenderRender] 🟢 Render-Server ONLINE (Version abc1234, Blender: bereit)
-[BlenderRender] 📤 Auftrag angenommen: Avatar von 'DeinRobloxName' (job f727e9b4)
-[BlenderRender] ⏳ Avatar wird von Roblox heruntergeladen (3D-Modell inkl. Texturen) ...
-[BlenderRender] ⏳ 3D-Modell wird in Blender geladen, Glas-Material wird erstellt ...
-[BlenderRender] ⏳ Blender Cycles RENDERT den Avatar ... 34 %
-[BlenderRender] ⏳ Blender Cycles RENDERT den Avatar ... 71 %
-[BlenderRender] ✅ Render abgeschlossen! ('DeinRobloxName')
-[BlenderRender] 📦 Bild ist fertig: 1024x1024 Pixel - uebertrage es stueckweise ...
-[BlenderRender] 🖼️ Server-EditableImage erstellt (1024x1024)
-[BlenderRender] 📡 Bild-Uebertragung: 8 / 64 Pakete (12 % der Zeilen)
-[BlenderRender] 📡 Bild-Uebertragung: 32 / 64 Pakete (50 % der Zeilen)
-[BlenderRender] 🎉 FERTIG! Bild (1024x1024) komplett - es sollte im Client-GUI sichtbar sein.
+[BlenderRender] [1/5] Server verbunden: Render-Server ONLINE (Version abc1234) (5% - Rest: ~30s)
+[BlenderRender] [1/5] Auftrag angenommen: Auftrag fuer 'DeinRobloxName' registriert (8% - Rest: ~28s)
+[BlenderRender] [2/5] Avatar-Koerperteile & Texturen laden: 15 Teile geladen (15% - Rest: ~25s)
+[BlenderRender] [3/5] 3D-Rig & Materialien in Blender vorbereiten: R15-Armature aufgebaut (25% - Rest: ~20s)
+[BlenderRender] [4/5] Blender Cycles High-End Rendern: Sample 48/96 (65% - Rest: ~12s)
+[BlenderRender] [5/5] Bild uebertragen: Empfange 1024x1024 Pixel ... (95% - Rest: ~2s)
+[BlenderRender] [5/5] Fertig!: Bild (1024x1024) erfolgreich im GUI angezeigt. (100% - Rest: ~0s)
 ```
 
-5. Gleichzeitig erscheint in der Spielszene das GUI-Fenster
-   **„🧊 Avatar-Render (Blender Cycles)“** – erst mit dem Statustext, dann
-   füllt sich das Bild von oben nach unten mit deinem Glas-Avatar. 🧊
+5. Im Spiel öffnet sich das moderne GUI-Fenster **„🧊 Blender Render Studio“**:
+   - Oben: Eingabefeld für beliebige Benutzernamen & **„🚀 Rendern“**-Knopf
+   - Mitte: Live-Bildanzeige mit EditableImage
+   - Unten: Schritt-Badge (`Schritt 4 von 5`), geschätzte Restzeit (`⏱️ Restzeit: ~12 s`),
+     präziser Statustext und animierter Farbverlauf-Ladebalken mit Prozentangabe!
 
 ## Extra: Weitere Renders starten
 
-Tippe im **Chat** (Testspiel, Taste `/`):
-- `!render` → rendert den Avatar aus `ROBLOX_USERNAME` noch einmal
-- `!render AndererName` → rendert einen beliebigen anderen Avatar
+- **Direkt im GUI:** Namen in das Textfeld eingeben und auf **„🚀 Rendern“** klicken!
+- **Oder im Chat (Taste `/`):**
+  - `!render` → rendert den aktuellen Benutzer erneut
+  - `!render AndererName` → rendert den Avatar eines beliebigen anderen Spielers
 
 ---
 

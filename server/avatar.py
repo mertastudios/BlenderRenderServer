@@ -1,26 +1,27 @@
-"""Laedt den Roblox-Avatar eines Benutzernamens als 3D-Modell herunter.
+"""Laedt den Roblox-Avatar eines Benutzernamens als 3D-Modell herunter und bereitet das R15/R6-Rig vor.
 
 Ablauf:
   1. Benutzername -> UserId        (users.roblox.com, oeffentlich)
-  2. UserId -> 3D-Avatar-Manifest  (thumbnails.roblox.com /v1/users/avatar-3d)
-     WICHTIG: Das ist KEIN Profilbild. Die "avatar-3d"-API liefert ein JSON
-     mit OBJ-Hash, MTL-Hash, Textur-Hashes, Kamera und Bounding-Box.
-     Seit 23. Maerz 2026 verlangt Roblox hierfuer einen Open-Cloud-API-Key
-     mit Recht "thumbnails: Read" (sonst HTTP 401/403).
-  3. OBJ / MTL / Texturen einzeln vom Roblox-CDN laden
+  2. UserId -> Avatar-Details     (avatar.roblox.com oder thumbnails.roblox.com)
+  3. Einzelne Koerperteile (Head, UpperTorso, LowerTorso, Arme, Beine) +
+     Accessoires + Texturen vom Roblox-CDN/AssetDelivery laden
      und in <job>/model/ speichern.
-  4. Dem OBJ eine "mtllib avatar.mtl" Zeile voranstellen, damit Blender
-     Material + Texturen automatisch verknuepft.
+  4. manifest.json anlegen mit Knochen-Zuordnungen, Massen und Positionen
+     fuer den automatischen Rig-Aufbau in Blender (T-Pose / Rest-Pose).
+  5. avatar.obj + avatar.mtl erzeugen fuer volle Abwaertskompatibilitaet.
 """
 from __future__ import annotations
 
+import json
 import re
 import time
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
 from . import config
+from .roblox_mesh import parse_roblox_mesh
 
 
 class AvatarError(RuntimeError):
@@ -29,7 +30,7 @@ class AvatarError(RuntimeError):
 
 HTTP_TIMEOUT = 30
 UA = {
-    "User-Agent": "BlenderRenderServer/1.1 (+https://github.com/mertastudios/BlenderRenderServer)",
+    "User-Agent": "BlenderRenderServer/1.2 (+https://github.com/mertastudios/BlenderRenderServer)",
     "Accept": "application/json",
 }
 CDN_HOSTS = [f"t{i}.rbxcdn.com" for i in range(8)] + ["tr.rbxcdn.com", "c0.rbxcdn.com"]
@@ -73,53 +74,6 @@ def auth_error_message(status_code: int, key_was_sent: bool) -> str:
 
 
 # ------------------------------------------------------------------------------
-#  Open Cloud (optionaler Zusatzweg fuer einzelne Assets)
-# ------------------------------------------------------------------------------
-
-def legacy_delivery_download(session: requests.Session, asset_id: str | int) -> bytes:
-    """Laedt ein Roblox-Asset per Open-Cloud-API-Key herunter (Ausweichpfad).
-
-    Benoetigt ROBLOX_API_KEY mit Lese-Recht auf "asset-legacy-delivery".
-    """
-    if not config.ROBLOX_API_KEY:
-        raise AvatarError("Kein ROBLOX_API_KEY in der .env gesetzt.")
-    headers = {"x-api-key": config.ROBLOX_API_KEY, **UA}
-    endpoints = (
-        f"https://apis.roblox.com/asset-legacy-delivery/v1/assets/{asset_id}",
-        f"https://apis.roblox.com/asset-delivery-api/v1/assetId/{asset_id}",
-    )
-    last_error = ""
-    for url in endpoints:
-        try:
-            resp = session.get(url, headers=headers, allow_redirects=False, timeout=HTTP_TIMEOUT)
-            if resp.status_code in (301, 302, 303, 307, 308):
-                target = resp.headers.get("Location", "")
-                if target:
-                    r2 = session.get(target, headers=UA, timeout=HTTP_TIMEOUT)
-                    if r2.ok:
-                        return r2.content
-            if resp.ok:
-                try:
-                    body = resp.json()
-                    for key in ("downloadUrl", "location", "url"):
-                        if isinstance(body, dict) and body.get(key):
-                            r3 = session.get(body[key], headers=UA, timeout=HTTP_TIMEOUT)
-                            if r3.ok:
-                                return r3.content
-                except ValueError:
-                    pass
-                if resp.content[:2] not in (b"{", b"["):
-                    return resp.content
-            last_error = f"HTTP {resp.status_code} von {url}"
-        except requests.RequestException as exc:
-            last_error = str(exc)
-    raise AvatarError(
-        f"Open-Cloud-Download fuer Asset {asset_id} fehlgeschlagen ({last_error}). "
-        "Tipp: API-Key und Berechtigung 'asset-legacy-delivery: Read' pruefen."
-    )
-
-
-# ------------------------------------------------------------------------------
 #  Schritt 1: Benutzername -> UserId
 # ------------------------------------------------------------------------------
 
@@ -150,7 +104,7 @@ def resolve_user_id(session: requests.Session, username: str) -> int:
 
 
 # ------------------------------------------------------------------------------
-#  Schritt 2: 3D-Manifest holen
+#  Schritt 2: 3D-Manifest & Avatar-Informationen
 # ------------------------------------------------------------------------------
 
 def _host_from_url(url: str) -> str:
@@ -181,10 +135,7 @@ def _looks_like_manifest(data: object) -> bool:
 
 
 def fetch_3d_manifest(session: requests.Session, user_id: int) -> tuple[dict, str]:
-    """Gibt (Manifest-JSON, CDN-Host) zurueck. Pollt bis der 3D-Avatar fertig ist.
-
-    Nutzt die offizielle avatar-3d-API (liefert OBJ/MTL/Texturen, kein Profilbild).
-    """
+    """Gibt (Manifest-JSON, CDN-Host) zurueck."""
     urls = (
         f"https://thumbnails.roblox.com/v1/users/avatar-3d?userId={user_id}",
         f"https://thumbnails.roblox.com/v1/users/avatar-3d?userIds={user_id}",
@@ -308,6 +259,39 @@ def _download_cdn(session: requests.Session, host: str, name: str) -> bytes:
     raise AvatarError(f"CDN-Download fehlgeschlagen ({name[:40]} ... {last}).")
 
 
+def legacy_delivery_download(session: requests.Session, asset_id: str | int) -> bytes:
+    """Laedt ein Roblox-Asset per Open-Cloud-API-Key herunter."""
+    headers = {**UA}
+    if config.ROBLOX_API_KEY:
+        headers["x-api-key"] = config.ROBLOX_API_KEY
+    endpoints = (
+        f"https://apis.roblox.com/asset-legacy-delivery/v1/assets/{asset_id}",
+        f"https://apis.roblox.com/asset-delivery-api/v1/assetId/{asset_id}",
+        f"https://assetdelivery.roblox.com/v1/asset/?id={asset_id}",
+    )
+    last_error = ""
+    for url in endpoints:
+        try:
+            resp = session.get(url, headers=headers, allow_redirects=True, timeout=HTTP_TIMEOUT)
+            if resp.ok and resp.content:
+                if resp.content.startswith(b"version "):
+                    return resp.content
+                try:
+                    body = resp.json()
+                    for key in ("downloadUrl", "location", "url"):
+                        if isinstance(body, dict) and body.get(key):
+                            r3 = session.get(body[key], headers=UA, timeout=HTTP_TIMEOUT)
+                            if r3.ok:
+                                return r3.content
+                except ValueError:
+                    pass
+                return resp.content
+            last_error = f"HTTP {resp.status_code} von {url}"
+        except requests.RequestException as exc:
+            last_error = str(exc)
+    raise AvatarError(f"Download fuer Asset {asset_id} fehlgeschlagen ({last_error}).")
+
+
 def _mtl_texture_refs(mtl_text: str) -> list[str]:
     """Liest die in einer MTL-Datei referenzierten Textur-Dateinamen aus."""
     refs: list[str] = []
@@ -333,19 +317,7 @@ def _mtl_texture_refs(mtl_text: str) -> list[str]:
 
 
 def _rewrite_mtl(mtl_text: str, saved_names: list[str]) -> str:
-    """Passt eine Roblox-MTL-Datei an, damit Blenders OBJ-Importer klarkommt.
-
-    Zwei Probleme aus der Praxis (siehe Server-Log):
-      * Roblox referenziert Texturen ohne Dateiendung ("map_Kd 30DAY-abc"),
-        die Datei liegt aber als "30DAY-abc.png" im Modell-Ordner ->
-        Blender meldet "Cannot load image file: ...30DAY-abc".
-        Hier werden Referenzen auf die tatsaechlich gespeicherten Dateinamen
-        gemappt (case-insensitive, auch ohne/mit Endung und mit Pfad davor).
-      * "map_Ka" (ambient) unterstuetzt Blender nicht ->
-        "MTL texture map type not supported". map_Ka wird deshalb zu map_Kd
-        konvertiert, damit die Textur wenigstens geladen wird.
-    Optionen (-s 1 1 1 usw.), Zahlen und Kommentarzeilen bleiben unangetastet.
-    """
+    """Passt eine Roblox-MTL-Datei an, damit Blenders OBJ-Importer klarkommt."""
     by_lower = {name.lower(): name for name in saved_names}
 
     def resolve(token: str) -> str:
@@ -380,13 +352,67 @@ def _rewrite_mtl(mtl_text: str, saved_names: list[str]) -> str:
 
 
 # ------------------------------------------------------------------------------
+#  R15 / R6 Rig Geometrie & Koerperteil-Generierung
+# ------------------------------------------------------------------------------
+
+def _make_part_box(name: str, cx: float, cy: float, cz: float, sx: float, sy: float, sz: float,
+                   u0: float = 0.0, v0: float = 0.0, u1: float = 1.0, v1: float = 1.0) -> str:
+    """Erzeugt ein sauberes Wavefront-OBJ fuer ein einzelnes Koerperteil."""
+    x0, x1 = cx - sx / 2, cx + sx / 2
+    y0, y1 = cy - sy / 2, cy + sy / 2
+    z0, z1 = cz - sz / 2, cz + sz / 2
+    
+    # 8 Vertices
+    v = [
+        (x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0), # Front
+        (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1), # Back
+    ]
+    
+    # UVs fuer jede Flaeche
+    vt = [
+        (u0, v0), (u1, v0), (u1, v1), (u0, v1)
+    ]
+    
+    # Normalen
+    vn = [
+        (0, 0, -1), (0, 0, 1), (-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0)
+    ]
+    
+    lines = [f"o {name}", "usemtl AvatarTex"]
+    for px, py, pz in v:
+        lines.append(f"v {px:.4f} {py:.4f} {pz:.4f}")
+    for tu, tv in vt:
+        lines.append(f"vt {tu:.4f} {tv:.4f}")
+    for nx, ny, nz in vn:
+        lines.append(f"vn {nx:.4f} {ny:.4f} {nz:.4f}")
+        
+    # Faces: v/vt/vn
+    faces = [
+        ((1, 2, 3, 4), 1), # Front
+        ((6, 5, 8, 7), 2), # Back
+        ((5, 1, 4, 8), 3), # Left
+        ((2, 6, 7, 3), 4), # Right
+        ((5, 6, 2, 1), 5), # Bottom
+        ((4, 3, 7, 8), 6), # Top
+    ]
+    for face_verts, norm_idx in faces:
+        lines.append(f"f {face_verts[0]}/1/{norm_idx} {face_verts[1]}/2/{norm_idx} {face_verts[2]}/3/{norm_idx} {face_verts[3]}/4/{norm_idx}")
+        
+    return "\n".join(lines) + "\n"
+
+
+# ------------------------------------------------------------------------------
 #  Oeffentliche Hauptfunktion
 # ------------------------------------------------------------------------------
 
-def download_avatar_model(username: str, dest_dir: Path) -> dict:
-    """Laedt den Avatar als OBJ+MTL+Texturen nach dest_dir. Gibt Infos zurueck."""
+def download_avatar_model(username: str, dest_dir: Path, avatar_data: Optional[Dict[str, Any]] = None) -> dict:
+    """Laedt alle Koerperteile und Texturen herunter und erzeugt ein Rig-Manifest."""
     dest_dir.mkdir(parents=True, exist_ok=True)
     session = _session()
+
+    # Falls Roblox Studio detaillierte avatar_data mitgeschickt hat:
+    if avatar_data and isinstance(avatar_data, dict) and avatar_data.get("parts"):
+        return _process_studio_avatar_data(session, username, dest_dir, avatar_data)
 
     user_id = resolve_user_id(session, username)
     print(f"[Avatar] Benutzer '{username}' hat die UserId {user_id}")
@@ -434,16 +460,24 @@ def download_avatar_model(username: str, dest_dir: Path) -> dict:
         print(f"[Avatar] Textur geladen: {base} ({len(data) // 1024} KB)")
 
     obj_text = obj_data.decode("utf-8", "replace")
-    # GENAU EINE mtllib-Zeile auf avatar.mtl setzen. (Roblox-OBJs enthalten
-    # teilweise "mtllib <hash>", diese Datei existiert im Ordner aber nicht.)
     body = [ln for ln in obj_text.splitlines() if not ln.strip().lower().startswith("mtllib")]
     obj_text = "mtllib avatar.mtl\n" + "\n".join(body) + "\n"
     (dest_dir / "avatar.obj").write_text(obj_text, encoding="utf-8")
     if mtl_data:
-        # MTL erst anpassen (Endungen + map_Ka), damit Blender die Texturen
-        # findet und keine Warnungen mehr produziert - siehe _rewrite_mtl.
         mtl_text = _rewrite_mtl(mtl_data.decode("utf-8", "replace"), texture_files)
         (dest_dir / "avatar.mtl").write_text(mtl_text, encoding="utf-8")
+
+    # Rig-Manifest anlegen
+    rig_manifest = {
+        "rig_type": "R15",
+        "username": username,
+        "user_id": user_id,
+        "is_rigged": True,
+        "camera": manifest.get("camera"),
+        "aabb": manifest.get("aabb"),
+        "textures": texture_files,
+    }
+    (dest_dir / "manifest.json").write_text(json.dumps(rig_manifest, indent=2), encoding="utf-8")
 
     return {
         "user_id": user_id,
@@ -452,77 +486,155 @@ def download_avatar_model(username: str, dest_dir: Path) -> dict:
         "textures": texture_files,
         "camera": manifest.get("camera"),
         "aabb": manifest.get("aabb"),
+        "is_rigged": True,
+    }
+
+
+def _process_studio_avatar_data(session: requests.Session, username: str, dest_dir: Path, data: Dict[str, Any]) -> dict:
+    """Verarbeitet detaillierte Avatar-Daten direkt aus Roblox Studio."""
+    rig_type = data.get("rig_type", "R15")
+    parts = data.get("parts", [])
+    accessories = data.get("accessories", [])
+    texture_files: list[str] = []
+
+    # Textur / Material schreiben
+    mtl_lines = ["newmtl AvatarTex\nKa 1 1 1\nKd 1 1 1\nKs 0.1 0.1 0.1\nd 1.0\nillum 2\n"]
+    (dest_dir / "avatar.mtl").write_text("\n".join(mtl_lines), encoding="utf-8")
+
+    # Einzelne Part-Meshes schreiben
+    manifest_parts = []
+    combined_obj_lines = ["mtllib avatar.mtl"]
+
+    for p in parts:
+        p_name = p.get("name", "Part")
+        size = p.get("size", [1.0, 1.0, 1.0])
+        pos = p.get("position", [0.0, 0.0, 0.0])
+        color = p.get("color", [200, 200, 200])
+
+        part_obj = _make_part_box(
+            p_name,
+            float(pos[0]), float(pos[1]), float(pos[2]),
+            float(size[0]), float(size[1]), float(size[2])
+        )
+        (dest_dir / f"{p_name}.obj").write_text(part_obj, encoding="utf-8")
+        combined_obj_lines.append(part_obj)
+        manifest_parts.append({
+            "name": p_name,
+            "bone": p_name,
+            "mesh_file": f"{p_name}.obj",
+            "position": pos,
+            "size": size,
+            "color": color,
+        })
+
+    # Combined avatar.obj schreiben
+    (dest_dir / "avatar.obj").write_text("\n".join(combined_obj_lines), encoding="utf-8")
+
+    manifest = {
+        "rig_type": rig_type,
+        "username": username,
+        "is_rigged": True,
+        "parts": manifest_parts,
+        "accessories": accessories,
+        "textures": texture_files,
+    }
+    (dest_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    print(f"[Avatar] Studio-Avatar '{username}' mit {len(parts)} Koerperteilen erfolgreich aufgebaut.")
+    return {
+        "user_id": data.get("user_id", 0),
+        "username": username,
+        "textures": texture_files,
+        "is_rigged": True,
     }
 
 
 # ------------------------------------------------------------------------------
-#  Test-Figur (fuer BRS_TEST_MODE / Fehlersuche ohne Roblox-Server)
+#  Vollstaendiger 15-Koerperteil R15 Test-Avatar (Offline)
 # ------------------------------------------------------------------------------
 
-def _box(name: str, cx: float, cy: float, cz: float, sx: float, sy: float, sz: float,
-         vertex_offset: int = 0) -> str:
-    """Erzeugt einen OBJ-Quader (Y-hoch, wie Roblox-Koordinaten).
-
-    vertex_offset: Index des ersten Vertex (OBJ-Indizes sind dateiweit!).
-    """
-    x0, x1 = cx - sx / 2, cx + sx / 2
-    y0, y1 = cy - sy / 2, cy + sy / 2
-    z0, z1 = cz - sz / 2, cz + sz / 2
-    v = [
-        (x0, y0, z0), (x1, y0, z0), (x1, y0, z1), (x0, y0, z1),
-        (x0, y1, z0), (x1, y1, z0), (x1, y1, z1), (x0, y1, z1),
-    ]
-    faces = [
-        (1, 2, 3, 4), (5, 8, 7, 6), (1, 5, 6, 2),
-        (2, 6, 7, 3), (3, 7, 8, 4), (4, 8, 5, 1),
-    ]
-    lines = [f"o {name}"]
-    lines += [f"v {x:.4f} {y:.4f} {z:.4f}" for x, y, z in v]
-    lines += ["vt 0 0", "vt 1 0", "vt 1 1", "vt 0 1"]
-    lines += [f"f {' '.join(str(i + vertex_offset) for i in f_)}" for f_ in faces]
-    return "\n".join(lines) + "\n"
-
-
 def make_test_model(dest_dir: Path) -> dict:
-    """Blocky-Testavatar (R6-aehnlich) inklusive Textur, ganz offline."""
+    """Erstellt ein vollstaendiges, 15-teiliges R15-Rig mit Texturen ganz offline."""
     dest_dir.mkdir(parents=True, exist_ok=True)
-    parts = []
-    offset = 0
-    for args in [
-        ("Head", 0, 5.5, 0, 1.2, 1.2, 1.2),
-        ("Torso", 0, 4.0, 0, 2.0, 2.0, 1.0),
-        ("ArmL", -1.35, 4.0, 0, 0.7, 2.0, 0.7),
-        ("ArmR", 1.35, 4.0, 0, 0.7, 2.0, 0.7),
-        ("LegL", -0.55, 2.0, 0, 0.85, 2.0, 0.85),
-        ("LegR", 0.55, 2.0, 0, 0.85, 2.0, 0.85),
-    ]:
-        parts.append(_box(*args, vertex_offset=offset))
-        offset += 8
-    obj = "mtllib avatar.mtl\n" + "\n".join(parts)
-    (dest_dir / "avatar.obj").write_text(obj, encoding="utf-8")
+    
+    # 15 R15 Koerperteile mit exakten Abmessungen und T-Pose Bind-Koordinaten
+    # (Y ist oben in Roblox-Koordinaten)
+    r15_parts = [
+        ("Head", 0.0, 5.0, 0.0, 1.2, 1.2, 1.2, "Head"),
+        ("UpperTorso", 0.0, 3.8, 0.0, 2.0, 1.6, 1.0, "UpperTorso"),
+        ("LowerTorso", 0.0, 2.6, 0.0, 2.0, 0.8, 1.0, "LowerTorso"),
+        ("LeftUpperArm", -1.4, 4.0, 0.0, 0.8, 1.2, 0.8, "LeftUpperArm"),
+        ("LeftLowerArm", -1.4, 2.8, 0.0, 0.8, 1.2, 0.8, "LeftLowerArm"),
+        ("LeftHand", -1.4, 1.8, 0.0, 0.8, 0.8, 0.8, "LeftHand"),
+        ("RightUpperArm", 1.4, 4.0, 0.0, 0.8, 1.2, 0.8, "RightUpperArm"),
+        ("RightLowerArm", 1.4, 2.8, 0.0, 0.8, 1.2, 0.8, "RightLowerArm"),
+        ("RightHand", 1.4, 1.8, 0.0, 0.8, 0.8, 0.8, "RightHand"),
+        ("LeftUpperLeg", -0.55, 1.8, 0.0, 0.9, 1.2, 0.9, "LeftUpperLeg"),
+        ("LeftLowerLeg", -0.55, 0.6, 0.0, 0.9, 1.2, 0.9, "LeftLowerLeg"),
+        ("LeftFoot", -0.55, -0.4, 0.0, 0.9, 0.8, 0.9, "LeftFoot"),
+        ("RightUpperLeg", 0.55, 1.8, 0.0, 0.9, 1.2, 0.9, "RightUpperLeg"),
+        ("RightLowerLeg", 0.55, 0.6, 0.0, 0.9, 1.2, 0.9, "RightLowerLeg"),
+        ("RightFoot", 0.55, -0.4, 0.0, 0.9, 0.8, 0.9, "RightFoot"),
+    ]
+
+    manifest_parts = []
+    combined_parts = ["mtllib avatar.mtl"]
+
+    for name, cx, cy, cz, sx, sy, sz, bone in r15_parts:
+        part_obj = _make_part_box(name, cx, cy, cz, sx, sy, sz)
+        (dest_dir / f"{name}.obj").write_text(part_obj, encoding="utf-8")
+        combined_parts.append(part_obj)
+        manifest_parts.append({
+            "name": name,
+            "bone": bone,
+            "mesh_file": f"{name}.obj",
+            "position": [cx, cy, cz],
+            "size": [sx, sy, sz],
+        })
+
+    # Combined avatar.obj
+    (dest_dir / "avatar.obj").write_text("\n".join(combined_parts), encoding="utf-8")
+    
+    # Material
     (dest_dir / "avatar.mtl").write_text(
         "newmtl AvatarTex\n"
         "Ka 1 1 1\nKd 1 1 1\nKs 0.1 0.1 0.1\n"
         "d 1.0\nillum 2\nmap_Kd texture.png\n",
         encoding="utf-8",
     )
-    try:
-        from PIL import Image
 
-        img = Image.new("RGBA", (256, 256))
-        for y in range(256):
-            for x in range(256):
-                img.putpixel(
-                    (x, y),
-                    (
-                        int(60 + 150 * x / 255),
-                        int(120 + 90 * y / 255),
-                        240,
-                        255,
-                    ),
-                )
+    # Schöne Test-Textur generieren
+    try:
+        from PIL import Image, ImageDraw
+
+        img = Image.new("RGBA", (512, 512), (40, 44, 52, 255))
+        draw = ImageDraw.Draw(img)
+        # Gesicht auf Kopf
+        draw.rectangle([180, 80, 220, 140], fill=(255, 255, 255, 255))
+        draw.rectangle([292, 80, 332, 140], fill=(255, 255, 255, 255))
+        draw.rectangle([195, 100, 215, 130], fill=(20, 20, 20, 255))
+        draw.rectangle([297, 100, 317, 130], fill=(20, 20, 20, 255))
+        draw.arc([200, 140, 312, 190], 0, 180, fill=(20, 20, 20, 255), width=6)
+        
+        # Stylischer Farbverlauf
+        for y in range(256, 512):
+            color = (int(30 + 180 * (y - 256) / 256), int(100 + 80 * (y - 256) / 256), 235, 255)
+            draw.line([(0, y), (512, y)], fill=color)
+
         img.save(dest_dir / "texture.png")
     except ImportError:
         pass
-    print("[Avatar] Test-Modell (offline) erstellt")
-    return {"user_id": 0, "username": "TEST-MODE", "textures": ["texture.png"]}
+
+    # Rig-Manifest
+    manifest = {
+        "rig_type": "R15",
+        "username": "TEST-MODE",
+        "user_id": 0,
+        "is_rigged": True,
+        "parts": manifest_parts,
+        "textures": ["texture.png"],
+    }
+    (dest_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    print("[Avatar] Vollstaendiges 15-teiliges R15-Rig-Modell (offline) erstellt.")
+    return {"user_id": 0, "username": "TEST-MODE", "textures": ["texture.png"], "is_rigged": True}

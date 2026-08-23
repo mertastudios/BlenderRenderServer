@@ -24,11 +24,12 @@ Das System besteht aus zwei Teilen:
 - **Ein-Klick-Setup**: `01_setup.bat` installiert Python + Blender 4.5 automatisch (Windows 10/11)
 - **Komplett kostenlos** – alles läuft lokal auf deinem PC
 - **Auto-Start**: startet nach jedem PC-Neustart automatisch (auf Wunsch)
-- **Auto-Update**: sobald auf GitHub neue Änderungen (gemergte Pull Requests) im `main`-Branch ankommen, aktualisiert sich das System selbst und startet neu
-- **Nur ein Auftrag gleichzeitig** (+ maximal einer in der Warteschlange) – immer klar, was gerade passiert
-- **Roblox-Integration**: fertiges Bild wird stückweise als **EditableImage**-Pixelpuffer an Roblox übertragen und dort per RemoteEvent im Client in einem GUI angezeigt
+- **Live Auto-Update & Selbst-Neustart**: Sobald auf GitHub neue Änderungen im `main`-Branch ankommen, aktualisiert sich der Server im laufenden Betrieb selbst, startet automatisch neu und läuft nahtlos weiter
+- **Echtes R15/R6-Rigging & T-Pose**: Lädt alle 15 Körperteile und Texturen einzeln und baut ein echtes Knochenskelett (Armature) auf. Der Avatar kann in neutraler T-Pose (Rest-Pose) gerendert oder beliebig posiert werden
+- **Präzise Fortschrittsanzeige & Restzeit**: Detaillierte Schritte (1 bis 5), dynamische geschätzte Restzeit und animierter Ladebalken im Roblox-GUI
+- **Interaktive Roblox-Steuerung**: Benutzername direkt im GUI eingeben und Rendern per Knopfdruck starten
+- **Roblox-Integration**: fertiges Bild wird stückweise als **EditableImage**-Pixelpuffer an Roblox übertragen und dort per RemoteEvent im Client in einem modernen Dark-GUI angezeigt
 - **Konfiguration per `.env`-Datei** (mit `06_config_bearbeiten.bat` bequem im Editor änderbar)
-- **3D-Avatar, kein Profilbild**: es wird das echte OBJ/MTL/Textur-Modell geladen (Roblox-Endpunkt `avatar-3d`)
 - **Öffentliche HTTPS-Adresse** für veröffentlichte Spiele (`08_oeffentliche_adresse.bat`)
 
 ## 🚀 Schnellstart (Windows)

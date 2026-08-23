@@ -1,18 +1,17 @@
 """Auto-Update: haelt die lokale Installation auf dem Stand des GitHub-Haupt-Branchs.
 
 Funktionsweise:
-  - Alle N Sekunden den neuesten Commit von GITHUB_REPO@GITHUB_BRANCH abfragen.
+  - Commit-Hash von GITHUB_REPO@GITHUB_BRANCH abfragen (API, Atom-Feed oder Git).
   - Ist der Commit neuer als der zuletzt installierte, wird der Quellcode als
     ZIP von GitHub geladen und ueber die lokale Kopie kopiert.
     Geschuetzte Ordner/Dateien (venv, tools, data, logs, .env, .update) bleiben
     unberuehrt.
-  - Danach startet der Watchdog (run.py) den Server automatisch neu.
-
-Falls api.github.com blockiert ist (Firewall, Schule, Antivirus), werden
-automatisch Ausweichwege versucht (github.com Atom-Feed, git ls-remote).
+  - Danach veranlasst der Server einen sauberen Selbst-Neustart.
 """
 from __future__ import annotations
 
+import json
+import os
 import re
 import shutil
 import subprocess
@@ -21,6 +20,7 @@ import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
+from typing import Optional, Tuple
 
 import requests
 
@@ -35,23 +35,27 @@ PROTECTED = {
 }
 
 UA = {
-    "User-Agent": "BlenderRenderServer/1.1 (+https://github.com/mertastudios/BlenderRenderServer)",
+    "User-Agent": "BlenderRenderServer/1.2 (+https://github.com/mertastudios/BlenderRenderServer)",
     "Accept": "application/vnd.github+json",
+}
+
+_last_check_info = {
+    "timestamp": 0.0,
+    "current_sha": "",
+    "remote_sha": "",
+    "update_available": False,
+    "message": "",
 }
 
 
 def _read_state() -> dict:
     try:
-        import json
-
         return json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
 
 def _write_state(sha: str) -> None:
-    import json
-
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(
         json.dumps({"sha": sha, "updated_at": datetime.now().isoformat(timespec="seconds")}, indent=2),
@@ -161,32 +165,62 @@ def last_error_advice(detail: str) -> str:
     return "Rendern funktioniert trotzdem. Details: 09_verbindung_pruefen.bat"
 
 
+def get_status() -> dict:
+    """Liefert aktuellen Versions- und Update-Status."""
+    state = _read_state()
+    current_sha = state.get("sha", "")
+    return {
+        "current_version": current_sha[:7] if current_sha else config.version(),
+        "current_sha": current_sha,
+        "remote_version": _last_check_info["remote_sha"][:7] if _last_check_info["remote_sha"] else "unbekannt",
+        "remote_sha": _last_check_info["remote_sha"],
+        "update_available": _last_check_info["update_available"],
+        "last_check": _last_check_info["timestamp"],
+        "message": _last_check_info["message"],
+    }
+
+
 def check_and_apply(force: bool = False) -> tuple[bool, str]:
     """Prueft auf neue Version; installiert sie bei Bedarf.
 
     Rueckgabe: (wurde_update_installiert, meldung)
     """
     sha, err = remote_sha_detailed()
-    if not sha:
-        return False, f"{err} (Update uebersprungen). {last_error_advice(err)}"
-
     state = _read_state()
-    if state.get("sha") == sha and not force:
+    current_sha = state.get("sha", "")
+
+    _last_check_info["timestamp"] = time.time()
+    _last_check_info["current_sha"] = current_sha
+    _last_check_info["remote_sha"] = sha or ""
+
+    if not sha:
+        msg = f"{err} (Update uebersprungen). {last_error_advice(err)}"
+        _last_check_info["update_available"] = False
+        _last_check_info["message"] = msg
+        return False, msg
+
+    if current_sha == sha and not force:
+        _last_check_info["update_available"] = False
+        _last_check_info["message"] = f"Version aktuell ({sha[:7]})."
         return False, f"Version aktuell ({sha[:7]})."
 
-    if not state.get("sha") and not force:
+    if not current_sha and not force:
         _write_state(sha)
+        _last_check_info["current_sha"] = sha
+        _last_check_info["update_available"] = False
+        _last_check_info["message"] = f"Initial-Version registriert: {sha[:7]}."
         return False, f"Initial-Version registriert: {sha[:7]}."
 
-    print(f"[Update] Neue Version auf GitHub gefunden ({sha[:7]}) - wird geladen ...")
-    zip_url = (
-        f"https://codeload.github.com/{config.GITHUB_REPO}/zip/refs/heads/{config.GITHUB_BRANCH}"
-    )
+    _last_check_info["update_available"] = True
+    print(f"[Update] Neue Version auf GitHub gefunden ({sha[:7]}) - wird heruntergeladen ...")
+    zip_url = f"https://codeload.github.com/{config.GITHUB_REPO}/zip/refs/heads/{config.GITHUB_BRANCH}"
     try:
         resp = requests.get(zip_url, timeout=120, headers=UA)
         resp.raise_for_status()
     except requests.RequestException as exc:
-        return False, f"Download fehlgeschlagen ({_short_exc(exc)}). Naechster Versuch spaeter."
+        msg = f"Download fehlgeschlagen ({_short_exc(exc)}). Naechster Versuch spaeter."
+        _last_check_info["message"] = msg
+        return False, msg
 
     with tempfile.TemporaryDirectory(prefix="brs_update_") as tmp:
         tmp_path = Path(tmp)
@@ -218,5 +252,8 @@ def check_and_apply(force: bool = False) -> tuple[bool, str]:
                 print(f"[Update] Warnung: {item.name} konnte nicht aktualisiert werden: {exc}")
 
     _write_state(sha)
+    _last_check_info["current_sha"] = sha
+    _last_check_info["update_available"] = False
+    _last_check_info["message"] = f"Update auf {sha[:7]} erfolgreich installiert."
     print(f"[Update] {changed} Objekte aktualisiert -> Version {sha[:7]} ({time.strftime('%H:%M:%S')})")
-    return True, f"Update auf {sha[:7]} installiert. Server startet neu."
+    return True, f"Update auf {sha[:7]} installiert. Server startet jetzt neu."
