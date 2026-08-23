@@ -136,13 +136,24 @@ class MtlFixupTests(unittest.TestCase):
 
 
 class DownloadAvatarModelTests(unittest.TestCase):
+    # Minimaler gueltiger PNG-Header (1x1 Pixel), damit die Bildvalidierung
+    # in _download_cdn(expect_image=True) nicht anschlaegt.
+    PNG_BYTES = (
+        b"\x89PNG\r\n\x1a\n"
+        b"\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+        b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
+        b"\x00\x00\x00\rIDATx\x9cc\xf8\xcf\xc0\x00\x00\x00\x03\x00\x01"
+        b"\x5b\xd4\x1b\x0e"
+        b"\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+
     def _run(self, tmp: str, obj_bytes: bytes):
-        def fake_cdn(_session, _host, name):
+        def fake_cdn(_session, _host, name, **_kwargs):
             if name == "objhash":
                 return obj_bytes
             if name == "mtlhash":
                 return b"newmtl m\nmap_Ka 30DAY-tex\nmap_Kd 30DAY-tex\n"
-            return b"PNGDATA"
+            return self.PNG_BYTES
 
         with patch.object(avatar, "resolve_user_id", return_value=42), \
              patch.object(avatar, "fetch_3d_manifest", return_value=(
@@ -176,6 +187,43 @@ class DownloadAvatarModelTests(unittest.TestCase):
             data = json.loads(manifest_file.read_text(encoding="utf-8"))
             self.assertEqual(data.get("rig_type"), "R15")
             self.assertTrue(data.get("is_rigged"))
+
+    def test_studio_boxes_path_is_ignored_even_when_avatar_data_sent(self):
+        """Regression: frueher wurden mit avatar_data aus Studio nur Boxen
+        ohne Meshes/Texturen gerendert (schwarze Quader). Jetzt MUSS immer
+        das echte 3D-Avatar-Modell heruntergeladen werden."""
+        with tempfile.TemporaryDirectory() as tmp:
+            studio_data = {
+                "rig_type": "R15",
+                "parts": [
+                    {"name": "Head", "size": [1, 1, 1], "position": [0, 5, 0], "color": [255, 255, 255]},
+                ],
+            }
+
+            def fake_cdn(_session, _host, name, **_kwargs):
+                if name == "objhash":
+                    return b"v 0 0 0\nf 1 1 1\n"
+                if name == "mtlhash":
+                    return b"newmtl m\nmap_Kd 30DAY-tex\n"
+                return self.PNG_BYTES
+
+            with patch.object(avatar, "resolve_user_id", return_value=42), \
+                 patch.object(avatar, "fetch_3d_manifest", return_value=(
+                     {"obj": "objhash", "mtl": "mtlhash", "textures": ["30DAY-tex"]},
+                     "t3.rbxcdn.com")), \
+                 patch.object(avatar, "_download_cdn", side_effect=fake_cdn) as mock_cdn:
+                avatar.download_avatar_model("MertaStudios", Path(tmp), avatar_data=studio_data)
+
+            # Echte OBJ-Datei vom CDN muss geladen worden sein, NICHT die
+            # generierten Boxen aus _process_studio_avatar_data.
+            called_names = [call.args[2] for call in mock_cdn.call_args_list]
+            self.assertIn("objhash", called_names)
+            self.assertIn("mtlhash", called_names)
+
+    def test_invalid_image_bytes_are_rejected(self):
+        self.assertFalse(avatar._is_valid_image(b"<html>error</html>"))
+        self.assertFalse(avatar._is_valid_image(b""))
+        self.assertTrue(avatar._is_valid_image(self.PNG_BYTES))
 
 
 class RiggingAndTestModelTests(unittest.TestCase):

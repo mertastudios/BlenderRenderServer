@@ -2,15 +2,14 @@
 --  BlenderRenderServer – SERVER-SKRIPT (Roblox Studio)
 --------------------------------------------------------------------------------
 --  WO EINFUEGEN?
---    Im Studio-Explorer:  ServerScriptService  → Rechtsklick → Insert Object
---    → "Script"  → diesen Text komplett einfuegen (alten Inhalt loeschen)
+--    Im Studio-Explorer:  ServerScriptService  -> Rechtsklick -> Insert Object
+--    -> "Script"  -> diesen Text komplett einfuegen (alten Inhalt loeschen)
 --
---  NEUE FEATURES:
---    * Vollstaendige R15/R6-Rig Extraktion: Liest alle Koerperteile, Positionen,
---      Masse, Accessoires & Texturen aus und schickt sie an den Render-Server
---    * Praezise Schritt-fuer-Schritt Status-Updates mit geschaetzter Restzeit
+--  VERHALTEN:
+--    * Reiner Hintergrund-Dienst: startet den Render beim Spielstart automatisch
+--    * Keine Benutzereingaben mehr (kein Button, keine Chat-Befehle)
+--    * Schickt Status-Updates an alle Clients und streamt das fertige Bild
 --    * Automatisches Reconnect-Handling bei Server-Updates & Neustarts
---    * RemoteFunction fuer direkte Render-Aufrufe aus dem Client-GUI
 --==============================================================================
 
 local HttpService       = game:GetService("HttpService")
@@ -21,7 +20,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 --========================= KONFIGURATION =====================================
 local RENDER_SERVER_URL   = "http://localhost:8000"
 local RENDER_ACCESS_TOKEN = "" -- Falls BRS_ACCESS_TOKEN in der .env gesetzt ist
-local DEFAULT_USERNAME    = "MertaStudios" -- Standard-Avatar beim Serverstart
+local DEFAULT_USERNAME    = "MertaStudios" -- Avatar, der beim Serverstart gerendert wird
 local POLL_SECONDS        = 2    -- Status-Abfrageintervall in Sekunden
 local HTTP_CHUNK_ROWS     = 16   -- Zeilen pro HTTP-Download
 local REMOTE_CHUNK_ROWS   = 8    -- Zeilen pro Client-Paket
@@ -41,13 +40,6 @@ if not remoteStatus then
 	remoteStatus = Instance.new("RemoteEvent")
 	remoteStatus.Name = "BlenderRender_Status"
 	remoteStatus.Parent = ReplicatedStorage
-end
-
-local remoteRequest = ReplicatedStorage:FindFirstChild("BlenderRender_Request")
-if not remoteRequest then
-	remoteRequest = Instance.new("RemoteFunction")
-	remoteRequest.Name = "BlenderRender_Request"
-	remoteRequest.Parent = ReplicatedStorage
 end
 
 --------------------------------------------------------------------------------
@@ -109,64 +101,6 @@ local function bufferSlice(src, byteOffset, byteLen)
 end
 
 --------------------------------------------------------------------------------
--- Avatar-Daten & Rig-Extraktion aus Roblox
---------------------------------------------------------------------------------
-
-local function extractAvatarData(username)
-	local targetPlayer = nil
-	for _, p in ipairs(Players:GetPlayers()) do
-		if string.lower(p.Name) == string.lower(username) then
-			targetPlayer = p
-			break
-		end
-	end
-
-	local char = targetPlayer and targetPlayer.Character
-	local humanoid = char and char:FindFirstChildOfClass("Humanoid")
-	local rigType = (humanoid and humanoid.RigType == Enum.HumanoidRigType.R6) and "R6" or "R15"
-
-	local partsData = {}
-	local accessoriesData = {}
-
-	if char then
-		local rootPart = char:FindFirstChild("HumanoidRootPart")
-		local rootCF = rootPart and rootPart.CFrame or char:GetPivot()
-
-		for _, item in ipairs(char:GetChildren()) do
-			if item:IsA("BasePart") and item.Name ~= "HumanoidRootPart" then
-				local relCF = rootCF:ToObjectSpace(item.CFrame)
-				local col = item.Color
-				table.insert(partsData, {
-					name = item.Name,
-					size = { item.Size.X, item.Size.Y, item.Size.Z },
-					position = { relCF.Position.X, relCF.Position.Y + 3.0, relCF.Position.Z },
-					color = { math.floor(col.R * 255), math.floor(col.G * 255), math.floor(col.B * 255) },
-				})
-			elseif item:IsA("Accessory") then
-				local handle = item:FindFirstChild("Handle")
-				if handle and handle:IsA("BasePart") then
-					local relCF = rootCF:ToObjectSpace(handle.CFrame)
-					local col = handle.Color
-					table.insert(accessoriesData, {
-						name = item.Name,
-						size = { handle.Size.X, handle.Size.Y, handle.Size.Z },
-						position = { relCF.Position.X, relCF.Position.Y + 3.0, relCF.Position.Z },
-						color = { math.floor(col.R * 255), math.floor(col.G * 255), math.floor(col.B * 255) },
-					})
-				end
-			end
-		end
-	end
-
-	return {
-		rig_type = rigType,
-		username = username,
-		parts = partsData,
-		accessories = accessoriesData,
-	}
-end
-
---------------------------------------------------------------------------------
 -- Phase 1: Warten auf Render-Server
 --------------------------------------------------------------------------------
 
@@ -192,10 +126,8 @@ end
 --------------------------------------------------------------------------------
 
 local function submitJob(username)
-	local avatarData = extractAvatarData(username)
 	local payload = {
 		username = username,
-		avatar_data = avatarData,
 	}
 	local ok, code, body = httpRequest("POST", "/jobs", payload)
 	local data = asTable(body)
@@ -271,7 +203,11 @@ local function transferImage(jobId)
 		serverImage = AssetService:CreateEditableImage({ Size = Vector2.new(width, height) })
 	end)
 
-	local target = Players:GetPlayers()[1]
+	-- Bild an alle aktuell verbundenen Clients streamen
+	local function getTargets()
+		return Players:GetPlayers()
+	end
+
 	local totalChunks = math.ceil(height / HTTP_CHUNK_ROWS)
 	local chunkIndex, y = 0, 0
 
@@ -293,13 +229,16 @@ local function transferImage(jobId)
 			end)
 		end
 
-		if target then
+		local targets = getTargets()
+		if #targets > 0 then
 			local y2 = y
 			while y2 < y + rowsInBuf do
 				local rows2 = math.min(REMOTE_CHUNK_ROWS, y + rowsInBuf - y2)
 				local offset = (y2 - y) * width * 4
 				local piece = bufferSlice(buf, offset, rows2 * width * 4)
-				remoteImage:FireClient(target, "chunk", jobId, y2, rows2, width, height, piece)
+				for _, target in ipairs(targets) do
+					remoteImage:FireClient(target, "chunk", jobId, y2, rows2, width, height, piece)
+				end
 				y2 = y2 + rows2
 				task.wait()
 			end
@@ -309,7 +248,7 @@ local function transferImage(jobId)
 		y = y + rowsInBuf
 	end
 
-	if target then
+	for _, target in ipairs(getTargets()) do
 		remoteImage:FireClient(target, "done", jobId, width, height)
 	end
 	broadcastStatus(5, 5, "Fertig!", ("Bild (%dx%d) erfolgreich im GUI angezeigt."):format(width, height), 100, 0, "done")
@@ -344,26 +283,8 @@ local function runPipeline(username)
 	isBusy = false
 end
 
--- RemoteFunction fuer Client-Aufrufe
-remoteRequest.OnServerInvoke = function(callingPlayer, requestedUsername)
-	local targetName = (requestedUsername and #requestedUsername > 0) and requestedUsername or callingPlayer.Name
-	task.spawn(runPipeline, targetName)
-	return true
-end
-
--- Chat-Befehle
-Players.PlayerAdded:Connect(function(newPlayer)
-	newPlayer.Chatted:Connect(function(msg)
-		local args = string.split(msg, " ")
-		if string.lower(args[1]) == "!render" then
-			local target = #args >= 2 and args[2] or newPlayer.Name
-			task.spawn(runPipeline, target)
-		end
-	end)
-end)
-
 print("==============================================================")
-print("[BlenderRender] Server-Skript initialisiert!")
+print("[BlenderRender] Server-Skript initialisiert (automatischer Render)!")
 print("[BlenderRender] Server-Adresse: " .. RENDER_SERVER_URL)
 print("[BlenderRender] Standard-User : " .. DEFAULT_USERNAME)
 print("==============================================================")
