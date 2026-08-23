@@ -2,40 +2,45 @@
 --  BlenderRenderServer – CLIENT-SKRIPT (Roblox Studio)
 --------------------------------------------------------------------------------
 --  WO EINFUEGEN?
---    Im Studio-Explorer:  StarterPlayer → StarterPlayerScripts → Rechtsklick
---    → Insert Object → "LocalScript"  → diesen Text komplett einfuegen
+--    Im Studio-Explorer:  StarterPlayer -> StarterPlayerScripts -> Rechtsklick
+--    -> Insert Object -> "LocalScript"  -> diesen Text komplett einfuegen
 --
---  NEUE FEATURES:
---    * Detaillierte Schritt-fuer-Schritt-Anzeige (Schritt 1 bis 5)
---    * Dynamische geschaetzte Restzeit & animierter Ladebalken mit Prozent
+--  VERHALTEN:
+--    * Reine Anzeige-GUI (keine Benutzereingaben / kein Rendern-Button)
+--    * Rendern startet automatisch beim Serverstart (RenderServerService)
+--    * Skaliert automatisch auf jede Bildschirmgroesse (nur "in scale")
 --    * Live-Bildempfang in ein hochaufloesendes EditableImage
---    * Interaktive Steuerung: Avatar-Auswahl per Eingabefeld & Rendern-Button
 --==============================================================================
 
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local AssetService      = game:GetService("AssetService")
 local TweenService      = game:GetService("TweenService")
+local Workspace         = game:GetService("Workspace")
 
 local player = Players.LocalPlayer
 local remoteImage  = ReplicatedStorage:WaitForChild("BlenderRender_Image", 30)
 local remoteStatus = ReplicatedStorage:WaitForChild("BlenderRender_Status", 30)
-local remoteReq    = ReplicatedStorage:WaitForChild("BlenderRender_Request", 30)
 
 --------------------------------------------------------------------------------
--- GUI AUFBAU (Modernes Dark-UI mit Animationen)
+-- GUI AUFBAU (Modernes Dark-UI, automatisch skaliert)
 --------------------------------------------------------------------------------
 
 local gui = Instance.new("ScreenGui")
 gui.Name = "BlenderRenderGUI"
 gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+-- Design-Aufloesung, in der das Layout konstruiert wird
+local DESIGN_W = 480
+local DESIGN_H = 620
 
 local mainFrame = Instance.new("Frame")
 mainFrame.Name = "MainFrame"
 mainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
 mainFrame.Position = UDim2.fromScale(0.5, 0.5)
-mainFrame.Size = UDim2.fromOffset(480, 680)
+mainFrame.Size = UDim2.fromOffset(DESIGN_W, DESIGN_H)
 mainFrame.BackgroundColor3 = Color3.fromRGB(20, 22, 28)
 mainFrame.BorderSizePixel = 0
 mainFrame.Active = true
@@ -50,6 +55,12 @@ local mainStroke = Instance.new("UIStroke")
 mainStroke.Color = Color3.fromRGB(45, 52, 68)
 mainStroke.Thickness = 1.5
 mainStroke.Parent = mainFrame
+
+-- UIScale: passt die komplette GUI an die Bildschirmgroesse an (ausschliesslich
+-- skaliert, es findet KEINE Layout-Verschiebung statt, sodass nichts "unter den
+-- Bildschirm rutschen" kann).
+local uiScale = Instance.new("UIScale")
+uiScale.Parent = mainFrame
 
 -- Kopfzeile -------------------------------------------------------------------
 local topBar = Instance.new("Frame")
@@ -89,55 +100,11 @@ closeBtn.MouseButton1Click:Connect(function()
 	gui:Destroy()
 end)
 
--- Steuerungs-Leiste (Benutzername & Rendern-Button) ----------------------------
-local controlBar = Instance.new("Frame")
-controlBar.Name = "ControlBar"
-controlBar.Size = UDim2.new(1, -32, 0, 36)
-controlBar.Position = UDim2.fromOffset(16, 52)
-controlBar.BackgroundTransparency = 1
-controlBar.Parent = mainFrame
-
-local userBox = Instance.new("TextBox")
-userBox.Name = "UserBox"
-userBox.Size = UDim2.new(1, -110, 1, 0)
-userBox.BackgroundColor3 = Color3.fromRGB(28, 32, 42)
-userBox.Text = player.Name
-userBox.PlaceholderText = "Roblox Benutzername"
-userBox.TextColor3 = Color3.fromRGB(230, 235, 245)
-userBox.PlaceholderColor3 = Color3.fromRGB(120, 130, 150)
-userBox.Font = Enum.Font.GothamMedium
-userBox.TextSize = 13
-userBox.ClearTextOnFocus = false
-userBox.Parent = controlBar
-
-local userCorner = Instance.new("UICorner")
-userCorner.CornerRadius = UDim.new(0, 8)
-userCorner.Parent = userBox
-
-local userPadding = Instance.new("UIPadding")
-userPadding.PaddingLeft = UDim.new(0, 10)
-userPadding.Parent = userBox
-
-local renderBtn = Instance.new("TextButton")
-renderBtn.Name = "RenderBtn"
-renderBtn.Size = UDim2.fromOffset(100, 36)
-renderBtn.Position = UDim2.new(1, -100, 0, 0)
-renderBtn.BackgroundColor3 = Color3.fromRGB(37, 99, 235)
-renderBtn.Text = "🚀 Rendern"
-renderBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-renderBtn.Font = Enum.Font.GothamBold
-renderBtn.TextSize = 13
-renderBtn.Parent = controlBar
-
-local renderCorner = Instance.new("UICorner")
-renderCorner.CornerRadius = UDim.new(0, 8)
-renderCorner.Parent = renderBtn
-
 -- Bild-Bereich ----------------------------------------------------------------
 local imageContainer = Instance.new("Frame")
 imageContainer.Name = "ImageContainer"
-imageContainer.Position = UDim2.fromOffset(16, 98)
-imageContainer.Size = UDim2.new(1, -32, 0, 420)
+imageContainer.Position = UDim2.fromOffset(16, 56)
+imageContainer.Size = UDim2.new(1, -32, 1, -208)
 imageContainer.BackgroundColor3 = Color3.fromRGB(15, 17, 22)
 imageContainer.BorderSizePixel = 0
 imageContainer.Parent = mainFrame
@@ -163,7 +130,7 @@ local placeholderLabel = Instance.new("TextLabel")
 placeholderLabel.Name = "Placeholder"
 placeholderLabel.Size = UDim2.fromScale(1, 1)
 placeholderLabel.BackgroundTransparency = 1
-placeholderLabel.Text = "Warte auf Render-Start ...\n(Klicke oben auf 'Rendern')"
+placeholderLabel.Text = "Warte auf automatischen Render-Start ..."
 placeholderLabel.TextColor3 = Color3.fromRGB(90, 100, 120)
 placeholderLabel.Font = Enum.Font.GothamMedium
 placeholderLabel.TextSize = 14
@@ -172,7 +139,8 @@ placeholderLabel.Parent = imageContainer
 -- Schritt- & Fortschritts-Anzeige ----------------------------------------------
 local progressCard = Instance.new("Frame")
 progressCard.Name = "ProgressCard"
-progressCard.Position = UDim2.fromOffset(16, 528)
+progressCard.AnchorPoint = Vector2.new(0, 1)
+progressCard.Position = UDim2.new(0, 16, 1, -16)
 progressCard.Size = UDim2.new(1, -32, 0, 136)
 progressCard.BackgroundColor3 = Color3.fromRGB(26, 30, 40)
 progressCard.BorderSizePixel = 0
@@ -216,7 +184,7 @@ stepTitle.Name = "StepTitle"
 stepTitle.Position = UDim2.fromOffset(12, 36)
 stepTitle.Size = UDim2.new(1, -24, 0, 20)
 stepTitle.BackgroundTransparency = 1
-stepTitle.Text = "Bereit"
+stepTitle.Text = "Verbinde ..."
 stepTitle.TextColor3 = Color3.fromRGB(230, 240, 255)
 stepTitle.Font = Enum.Font.GothamBold
 stepTitle.TextSize = 14
@@ -228,7 +196,7 @@ detailLabel.Name = "Detail"
 detailLabel.Position = UDim2.fromOffset(12, 58)
 detailLabel.Size = UDim2.new(1, -24, 0, 32)
 detailLabel.BackgroundTransparency = 1
-detailLabel.Text = "Klicke auf 'Rendern' um deinen Avatar in Cycles zu erstellen."
+detailLabel.Text = "Der Avatar wird automatisch auf dem Server gerendert."
 detailLabel.TextColor3 = Color3.fromRGB(140, 150, 170)
 detailLabel.Font = Enum.Font.Gotham
 detailLabel.TextSize = 12
@@ -281,6 +249,29 @@ percentLabel.TextXAlignment = Enum.TextXAlignment.Right
 percentLabel.Parent = progressCard
 
 gui.Parent = player:WaitForChild("PlayerGui")
+
+--------------------------------------------------------------------------------
+-- Automatische Skalierung (nur scale, kein Layoutumbau)
+--------------------------------------------------------------------------------
+-- Die GUI wird in der Design-Aufloesung 480x620 gebaut und anschliessend
+-- pauschal so skaliert, dass sie immer in den sichtbaren Bildschirm passt.
+-- Damit "rutscht" nichts mehr unter den Bildschirmrand.
+
+local function updateScale()
+	local camera = Workspace.CurrentCamera
+	if not camera then return end
+	local vp = camera.ViewportSize
+	if vp.X <= 0 or vp.Y <= 0 then return end
+	local sx = vp.X / DESIGN_W
+	local sy = vp.Y / DESIGN_H
+	uiScale.Scale = math.clamp(math.min(sx, sy), 0.25, 1.0)
+end
+
+updateScale()
+Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(updateScale)
+if Workspace.CurrentCamera then
+	Workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(updateScale)
+end
 
 --------------------------------------------------------------------------------
 -- EditableImage & Live-Stream Handling
@@ -403,25 +394,4 @@ if remoteImage then
 	end)
 end
 
--- Rendern-Button Klick --------------------------------------------------------
-renderBtn.MouseButton1Click:Connect(function()
-	local targetUser = userBox.Text:match("^%s*(.-)%s*$")
-	if #targetUser == 0 then
-		targetUser = player.Name
-	end
-	placeholderLabel.Visible = true
-	placeholderLabel.Text = "Auftrag wird an den Server gesendet ..."
-	destroyImage()
-	setProgress(5)
-	stepBadge.Text = "Schritt 1 von 5"
-	stepTitle.Text = "Verbindung herstellen"
-	detailLabel.Text = ("Auftrag fuer '%s' wird eingereicht ..."):format(targetUser)
-
-	if remoteReq then
-		task.spawn(function()
-			remoteReq:InvokeServer(targetUser)
-		end)
-	end
-end)
-
-print("[BlenderRender-Client] GUI erfolgreich geladen.")
+print("[BlenderRender-Client] GUI (reiner Anzeige-Modus) erfolgreich geladen.")

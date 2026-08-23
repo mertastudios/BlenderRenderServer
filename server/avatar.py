@@ -222,17 +222,68 @@ def fetch_3d_manifest(session: requests.Session, user_id: int) -> tuple[dict, st
 #  Schritt 3: Dateien vom CDN laden
 # ------------------------------------------------------------------------------
 
-def _download_cdn(session: requests.Session, host: str, name: str) -> bytes:
-    """Laedt eine Datei (per Hash-Namen) vom Roblox-CDN."""
+def _is_valid_image(data: bytes) -> bool:
+    """Schneller Plausibilitaetscheck fuer heruntergeladene Bilddaten."""
+    if not data or len(data) < 16:
+        return False
+    # PNG / JPEG / WebP / BMP / GIF / TIFF - Magic Bytes
+    sigs = (
+        b"\x89PNG\r\n\x1a\n",
+        b"\xff\xd8\xff",
+        b"RIFF",
+        b"BM",
+        b"GIF87a",
+        b"GIF89a",
+        b"II*\x00",
+        b"MM\x00*",
+    )
+    return any(data.startswith(sig) for sig in sigs)
+
+
+def _download_cdn(session: requests.Session, host: str, name: str,
+                  retries: int = 3, expect_image: bool = False) -> bytes:
+    """Laedt eine Datei (per Hash-Namen) vom Roblox-CDN mit Retries.
+
+    Roblox-CDNs antworten gelegentlich mit HTTP 5xx oder Connection-Resets,
+    wodurch einzelne Texturen fehlschlagen und der Avatar in Blender als
+    schwarze Quader erscheint. Wir versuchen Downloads mehrfach und pruefen
+    bei Texturen, ob die Antwort wirklich ein Bild ist (kein HTML-Fehler).
+    """
     name = (name or "").strip().strip("/")
+
+    def _get(url: str) -> Optional[bytes]:
+        for attempt in range(retries):
+            try:
+                resp = session.get(url, timeout=HTTP_TIMEOUT)
+            except requests.RequestException as exc:
+                last = str(exc)
+                if attempt < retries - 1:
+                    time.sleep(0.4 * (attempt + 1))
+                    continue
+                raise AvatarError(f"CDN-Download fehlgeschlagen ({url[:60]} ... {last}).") from exc
+            if resp.status_code in (429, 500, 502, 503, 504):
+                last = f"HTTP {resp.status_code}"
+                if attempt < retries - 1:
+                    time.sleep(0.4 * (attempt + 1))
+                    continue
+                return None
+            if resp.ok and resp.content:
+                content = resp.content
+                if expect_image and not _is_valid_image(content):
+                    # Manche CDNs liefern bei Fehlern HTML zurueck -> naechste URL
+                    if attempt < retries - 1:
+                        time.sleep(0.3)
+                        continue
+                    return None
+                return content
+            return None
+        return None
+
     if name.startswith("http://") or name.startswith("https://"):
-        try:
-            resp = session.get(name, timeout=HTTP_TIMEOUT)
-        except requests.RequestException as exc:
-            raise AvatarError(f"CDN-Download fehlgeschlagen ({name[:60]} ... {exc}).") from exc
-        if resp.ok and resp.content:
-            return resp.content
-        raise AvatarError(f"CDN-Download fehlgeschlagen ({name[:60]} ... HTTP {resp.status_code}).")
+        data = _get(name)
+        if data:
+            return data
+        raise AvatarError(f"CDN-Download fehlgeschlagen ({name[:60]}).")
 
     hosts: list[str] = []
     if host:
@@ -249,13 +300,13 @@ def _download_cdn(session: requests.Session, host: str, name: str) -> bytes:
             urls.append(f"https://{h}/{name}.png")
     for url in urls:
         try:
-            resp = session.get(url, timeout=HTTP_TIMEOUT)
-        except requests.RequestException as exc:
+            content = _get(url)
+        except AvatarError as exc:
             last = str(exc)
             continue
-        if resp.ok and resp.content:
-            return resp.content
-        last = f"HTTP {resp.status_code}"
+        if content:
+            return content
+        last = f"HTTP-Fehler bei {url.split('/')[2]}"
     raise AvatarError(f"CDN-Download fehlgeschlagen ({name[:40]} ... {last}).")
 
 
@@ -406,13 +457,16 @@ def _make_part_box(name: str, cx: float, cy: float, cz: float, sx: float, sy: fl
 # ------------------------------------------------------------------------------
 
 def download_avatar_model(username: str, dest_dir: Path, avatar_data: Optional[Dict[str, Any]] = None) -> dict:
-    """Laedt alle Koerperteile und Texturen herunter und erzeugt ein Rig-Manifest."""
+    """Laedt alle Koerperteile und Texturen herunter und erzeugt ein Rig-Manifest.
+
+    Der fruehere Pfad ueber die von Roblox Studio gesendeten ``avatar_data``
+    (einfache Boxen aus BasePart-Groessen/Positionen) wurde abgeschaltet: Er
+    erzeugte im Zweifel schwarze/weisse Quader ohne Meshes und Texturen, wenn
+    der Spieler beim Serverstart gerade im Spiel war. Jetzt wird IMMER das
+    echte 3D-Avatar-Modell (OBJ/MTL/Texturen) von Roblox heruntergeladen.
+    """
     dest_dir.mkdir(parents=True, exist_ok=True)
     session = _session()
-
-    # Falls Roblox Studio detaillierte avatar_data mitgeschickt hat:
-    if avatar_data and isinstance(avatar_data, dict) and avatar_data.get("parts"):
-        return _process_studio_avatar_data(session, username, dest_dir, avatar_data)
 
     user_id = resolve_user_id(session, username)
     print(f"[Avatar] Benutzer '{username}' hat die UserId {user_id}")
@@ -444,17 +498,25 @@ def download_avatar_model(username: str, dest_dir: Path, avatar_data: Optional[D
             refs.append(base)
 
     texture_files: list[str] = []
+    failed_refs: set[str] = set()
     for ref in refs:
         base = ref if "." in Path(ref).name else f"{ref}.png"
         base = Path(base).name
         try:
-            data = _download_cdn(session, host, ref)
+            data = _download_cdn(session, host, ref, expect_image=True)
         except AvatarError:
             try:
-                data = _download_cdn(session, host, base)
+                data = _download_cdn(session, host, base, expect_image=True)
             except AvatarError as exc:
                 print(f"[Avatar] Warnung: Textur {base} nicht ladbar ({exc})")
+                failed_refs.add(ref)
+                failed_refs.add(base)
                 continue
+        if not data:
+            print(f"[Avatar] Warnung: Textur {base} lieferte keine Bilddaten -> uebersprungen.")
+            failed_refs.add(ref)
+            failed_refs.add(base)
+            continue
         (dest_dir / base).write_bytes(data)
         texture_files.append(base)
         print(f"[Avatar] Textur geladen: {base} ({len(data) // 1024} KB)")
@@ -465,6 +527,25 @@ def download_avatar_model(username: str, dest_dir: Path, avatar_data: Optional[D
     (dest_dir / "avatar.obj").write_text(obj_text, encoding="utf-8")
     if mtl_data:
         mtl_text = _rewrite_mtl(mtl_data.decode("utf-8", "replace"), texture_files)
+        # Fehlgeschlagene Texturen aus der MTL entfernen, damit Blender nicht
+        # versucht, eine nicht existierende Datei zu laden (sonst schwarze
+        # Materialien / schwarze Quader im Render).
+        if failed_refs:
+            kept: list[str] = []
+            for line in mtl_text.splitlines():
+                stripped = line.strip()
+                parts = stripped.split()
+                if parts and (parts[0].lower().startswith("map_") or
+                              parts[0].lower() in ("bump", "norm", "disp", "refl")):
+                    target = next(
+                        (t for t in parts[1:]
+                         if not t.startswith("-") and not re.fullmatch(r"\d+(\.\d+)?", t)),
+                        "",
+                    )
+                    if target.replace("\\", "/").rsplit("/", 1)[-1] in failed_refs:
+                        continue
+                kept.append(line)
+            mtl_text = "\n".join(kept) + "\n"
         (dest_dir / "avatar.mtl").write_text(mtl_text, encoding="utf-8")
 
     # Rig-Manifest anlegen
