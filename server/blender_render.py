@@ -58,7 +58,12 @@ def _add_area_light(scene, name: str, energy: float, size: float, direction, dis
     return light_obj
 
 
-def _setup_world(scene):
+def _setup_world(scene, environment_path: Path | None = None):
+    """Richtet die Welt mit der mitgelieferten EXR-Umgebung ein.
+
+    Der Nishita-Himmel bleibt als robuster Fallback erhalten, damit lokale
+    Installationen mit einer unvollstaendigen/alten Kopie weiter rendern.
+    """
     import bpy
     from math import radians
 
@@ -71,43 +76,49 @@ def _setup_world(scene):
         nodes.remove(node)
     out = nodes.new("ShaderNodeOutputWorld")
     background = nodes.new("ShaderNodeBackground")
-    sky = nodes.new("ShaderNodeTexSky")
-    sky.sky_type = "NISHITA"
-    sky.sun_elevation = radians(38)
-    sky.sun_rotation = radians(160)
     background.inputs["Strength"].default_value = 1.0
-    links.new(sky.outputs["Color"], background.inputs["Color"])
+    if environment_path and environment_path.is_file():
+        environment = nodes.new("ShaderNodeTexEnvironment")
+        environment.name = "BRS_Sunset_JHBCentral"
+        environment.image = bpy.data.images.load(str(environment_path), check_existing=True)
+        links.new(environment.outputs["Color"], background.inputs["Color"])
+        _log(f"[Blender] Umgebungsbeleuchtung: {environment_path.name}")
+    else:
+        sky = nodes.new("ShaderNodeTexSky")
+        sky.sky_type = "NISHITA"
+        sky.sun_elevation = radians(38)
+        sky.sun_rotation = radians(160)
+        links.new(sky.outputs["Color"], background.inputs["Color"])
+        _log("[Blender] EXR nicht gefunden; verwende Nishita-Himmel.")
     links.new(background.outputs["Background"], out.inputs["Surface"])
     return world
 
 
-def _make_glass_material():
-    import bpy
+def _make_material_glassy(material):
+    """Macht ein importiertes, texturiertes Material glasig, aber opak.
 
-    glass = bpy.data.materials.new("RobloxGlass")
-    glass.use_nodes = True
-    bsdf = glass.node_tree.nodes.get("Principled BSDF")
-    if bsdf is None:
-        bsdf = glass.node_tree.nodes.new("ShaderNodeBsdfPrincipled")
-    inputs = bsdf.inputs
-    try:
-        inputs["Base Color"].default_value = (0.82, 0.91, 1.0, 1.0)
-        inputs["Metallic"].default_value = 0.0
-        inputs["Roughness"].default_value = 0.05
-        inputs["IOR"].default_value = 1.45
-    except KeyError:
-        pass
-    # "Coat" (Klarlack) sorgt fuer zusaetzliche, gut sichtbare Reflexe,
-    # damit der Glas-Avatar auch auf transparentem Hintergrund klar zu sehen ist.
-    for socket, value in (("Coat Weight", 0.45), ("Coat Roughness", 0.05)):
-        if socket in inputs:
-            inputs[socket].default_value = value
-    # Blender 4.x: "Transmission Weight", aeltere: "Transmission"
-    for socket in ("Transmission Weight", "Transmission"):
-        if socket in inputs:
-            inputs[socket].default_value = 1.0
-            break
-    return glass
+    Anders als echtes Transmissionsglas bleibt der Avatar dadurch voll
+    sichtbar. Vorhandene Base-Color-Verknuepfungen (Roblox-Texturen) werden
+    absichtlich nicht ersetzt.
+    """
+    material.use_nodes = True
+    if hasattr(material, "blend_method"):
+        material.blend_method = "OPAQUE"
+    for bsdf in (n for n in material.node_tree.nodes if n.type == "BSDF_PRINCIPLED"):
+        inputs = bsdf.inputs
+        if "Roughness" in inputs:
+            inputs["Roughness"].default_value = 0.12
+        if "IOR" in inputs:
+            inputs["IOR"].default_value = 1.45
+        # Keine Transmission: glasige Klarlack-Reflexe ohne Durchsichtigkeit.
+        for socket in ("Transmission Weight", "Transmission"):
+            if socket in inputs:
+                inputs[socket].default_value = 0.0
+        for socket, value in (("Coat Weight", 0.85), ("Coat", 0.85),
+                              ("Coat Roughness", 0.04), ("Clearcoat Roughness", 0.04)):
+            if socket in inputs:
+                inputs[socket].default_value = value
+    return material
 
 
 def _select_all(meshes):
@@ -222,13 +233,30 @@ def render_scene(params: dict, progress=None) -> None:
     bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
     report("loading", 0.8)
 
-    # 5) Material: Glas (oder Original behalten) --------------------------------
+    # Avatar-Thumbnail-OBJs sind bereits in der Profilpose gebacken und haben
+    # kein Rig. Eine echte Rueckkehr in die Ruhepose ist beim OBJ nicht moeglich;
+    # vorhandene Armatures (z.B. bei lokal bereitgestellten Modellen) werden aber
+    # sicher in ihre unverformte REST-Pose versetzt.
+    for armature in (o for o in scene.objects if o.type == "ARMATURE"):
+        armature.data.pose_position = "REST"
+
+    # Roblox schaut entlang -Z. Nach dem Aufrichten zeigt die Vorderseite +Y;
+    # 180 Grad um die Hochachse dreht den Torso frontal zur Kamera auf -Y.
+    _select_all(meshes)
+    for obj in meshes:
+        obj.rotation_euler.rotate_axis("Z", radians(180))
+    bpy.context.view_layer.update()
+    bpy.ops.object.transform_apply(location=False, rotation=True, scale=False)
+
+    # 5) Material: Originaltexturen plus opake, glasige Klarlackschicht ----------
     if material_mode == "glass":
-        _log("[Blender] Erzeuge Glas-Material ...")
-        glass = _make_glass_material()
+        _log("[Blender] Veredle Originalmaterialien opak und glasig ...")
+        seen_materials = set()
         for obj in meshes:
-            obj.data.materials.clear()
-            obj.data.materials.append(glass)
+            for material in obj.data.materials:
+                if material is not None and material.name not in seen_materials:
+                    _make_material_glassy(material)
+                    seen_materials.add(material.name)
     # Smooth shading fuer alle Flaechen
     for obj in meshes:
         for poly in obj.data.polygons:
@@ -236,7 +264,8 @@ def render_scene(params: dict, progress=None) -> None:
     report("loading", 1.0)
 
     # 6) Licht + Himmel ---------------------------------------------------------
-    _setup_world(scene)
+    environment_path = Path(__file__).resolve().parent.parent / "sunset_jhbcentral_4k.exr"
+    _setup_world(scene, environment_path)
     _add_area_light(scene, "BRS_Key", 500, 4.0, (1.5, -1.3, 1.7), 7.0)
     _add_area_light(scene, "BRS_Rim", 250, 3.0, (-1.7, 1.3, 1.0), 7.0)
     _add_area_light(scene, "BRS_Fill", 120, 6.0, (-0.6, -1.7, 0.3), 8.0)
@@ -247,7 +276,8 @@ def render_scene(params: dict, progress=None) -> None:
     radius = max(mx.x - mn.x, mx.y - mn.y, mx.z - mn.z) / 2 or 1.0
     fov_deg = 32.0
     distance = radius / tan(radians(fov_deg) / 2.0) * 1.3 + radius * 0.6
-    direction = Vector((1.35, -1.2, 0.5)).normalized()
+    # Frontal statt Profil-/Dreiviertelansicht; nur leicht von oben.
+    direction = Vector((0.0, -1.0, 0.12)).normalized()
     cam_data = bpy.data.cameras.new("BRS_Cam")
     cam_data.lens_unit = "FOV"
     cam_data.angle = radians(fov_deg)
