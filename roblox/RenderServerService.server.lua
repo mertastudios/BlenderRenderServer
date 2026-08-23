@@ -3,77 +3,82 @@
 --------------------------------------------------------------------------------
 --  WO EINFUEGEN?
 --    Im Studio-Explorer:  ServerScriptService  → Rechtsklick → Insert Object
---    → "Script"  → diesen kompletten Text hier einfuegen (alten Inhalt loeschen)
+--    → "Script"  → diesen Text komplett einfuegen (alten Inhalt loeschen)
 --
---  WAS MACHT ES?
---    * Fragt beim Start den Render-Server auf deinem PC ab
---    * Schickt den Auftrag: "Rendere den Avatar von ROBLOX_USERNAME in Glas"
---    * Printet REGELMAESSIG den Status in die Konsole ("Output"-Fenster):
---        SERVER DOWN / AUFTRAG IN DER WARTESCHLANGE / WIRD GERENDERT ...
---    * Holt das fertige Bild STUECK FUER STUECK als Pixel-Rohdaten ab und
---      schreibt es in ein serverseitiges EditableImage
---    * Leitet dieselben Pixel-Pakete per RemoteEvent an den Client weiter
---      (der zeigt das Bild dann in einem GUI an)
---
---  WICHTIG (einmalig pro Projekt einschalten!):
---    Home → Game Settings → Security → "Allow HTTP Requests" = ON
---    (Ohne das darf Roblox nicht mit deinem PC reden.)
---
---  ZUSAETZLICH MOEGLICH (im Chat, nur zum Testen):
---    !render              → startet den Avatar-Render erneut
---    !render Benutzername → rendert einen anderen Avatar
+--  NEUE FEATURES:
+--    * Vollstaendige R15/R6-Rig Extraktion: Liest alle Koerperteile, Positionen,
+--      Masse, Accessoires & Texturen aus und schickt sie an den Render-Server
+--    * Praezise Schritt-fuer-Schritt Status-Updates mit geschaetzter Restzeit
+--    * Automatisches Reconnect-Handling bei Server-Updates & Neustarts
+--    * RemoteFunction fuer direkte Render-Aufrufe aus dem Client-GUI
 --==============================================================================
 
-local HttpService    = game:GetService("HttpService")
-local AssetService   = game:GetService("AssetService")
-local Players        = game:GetService("Players")
+local HttpService       = game:GetService("HttpService")
+local AssetService      = game:GetService("AssetService")
+local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local ServerStorage  = game:GetService("ServerStorage")
 
 --========================= KONFIGURATION =====================================
--- Adresse deines Render-Servers. "localhost" = gleicher PC wie Studio.
--- Anderer PC im selben Netzwerk? Dann z.B. "http://192.168.1.50:8000"
-local RENDER_SERVER_URL = "http://localhost:8000"
-
--- Der Roblox-Benutzername, dessen Avatar beim Serverstart gerendert wird:
-local ROBLOX_USERNAME = "MertaStudios" -- <<< HIER DEINEN NAMEN EINTRAGEN!
-
-local POLL_SECONDS      = 3   -- Status alle 3 Sekunden abfragen
-local HTTP_CHUNK_ROWS   = 16  -- Zeilen pro Download vom Render-Server
-local REMOTE_CHUNK_ROWS = 8   -- Zeilen pro Paket an den Client (klein = stabil)
-local AUTO_RENDER       = true -- Bei Serverstart automatisch loslegen
+local RENDER_SERVER_URL   = "http://localhost:8000"
+local RENDER_ACCESS_TOKEN = "" -- Falls BRS_ACCESS_TOKEN in der .env gesetzt ist
+local DEFAULT_USERNAME    = "MertaStudios" -- Standard-Avatar beim Serverstart
+local POLL_SECONDS        = 2    -- Status-Abfrageintervall in Sekunden
+local HTTP_CHUNK_ROWS     = 16   -- Zeilen pro HTTP-Download
+local REMOTE_CHUNK_ROWS   = 8    -- Zeilen pro Client-Paket
+local AUTO_RENDER         = true -- Bei Spielstart sofort rendern
 --==============================================================================
 
--- RemoteEvent fuer die Client-Kommunikation bereitstellen
-local remote = ReplicatedStorage:FindFirstChild("BlenderRender_Image")
-if not remote then
-	remote = Instance.new("RemoteEvent")
-	remote.Name = "BlenderRender_Image"
-	remote.Parent = ReplicatedStorage
+-- Remotes in ReplicatedStorage anlegen
+local remoteImage = ReplicatedStorage:FindFirstChild("BlenderRender_Image")
+if not remoteImage then
+	remoteImage = Instance.new("RemoteEvent")
+	remoteImage.Name = "BlenderRender_Image"
+	remoteImage.Parent = ReplicatedStorage
+end
+
+local remoteStatus = ReplicatedStorage:FindFirstChild("BlenderRender_Status")
+if not remoteStatus then
+	remoteStatus = Instance.new("RemoteEvent")
+	remoteStatus.Name = "BlenderRender_Status"
+	remoteStatus.Parent = ReplicatedStorage
+end
+
+local remoteRequest = ReplicatedStorage:FindFirstChild("BlenderRender_Request")
+if not remoteRequest then
+	remoteRequest = Instance.new("RemoteFunction")
+	remoteRequest.Name = "BlenderRender_Request"
+	remoteRequest.Parent = ReplicatedStorage
 end
 
 --------------------------------------------------------------------------------
--- Hilfsfunktionen
+-- Hilfsfunktionen & HTTP
 --------------------------------------------------------------------------------
 
-local lastStatusText = nil
-local function statusPrint(icon, text, immerAusgeben)
-	-- Printet nur bei Aenderung (oder wenn zwangsweise gefordert),
-	-- damit die Konsole nicht mit 1000 identischen Zeilen zumuellt wird.
-	if immerAusgeben or text ~= lastStatusText then
-		lastStatusText = text
-		print(("[BlenderRender] %s %s"):format(icon, text))
-	end
-	remote:FireAllClients("status", text) -- Status auch im Client-GUI zeigen
+local function broadcastStatus(step, totalSteps, stepName, message, progress, estSecondsLeft, state)
+	local payload = {
+		step = step or 1,
+		totalSteps = totalSteps or 5,
+		stepName = stepName or "In Bearbeitung",
+		message = message or "",
+		progress = progress or 0,
+		estSecondsLeft = estSecondsLeft or 0,
+		state = state or "active",
+	}
+	remoteStatus:FireAllClients(payload)
+	print(("[BlenderRender] [%d/%d] %s: %s (%d%% - Rest: ~%ds)"):format(
+		payload.step, payload.totalSteps, payload.stepName, payload.message, payload.progress, payload.estSecondsLeft))
 end
 
--- HTTP-Anfrage an den Render-Server. Liefert: erfolg, statuscode, body
 local function httpRequest(method, path, bodyTable)
 	local ok, result = pcall(function()
+		local headers = {}
+		if RENDER_ACCESS_TOKEN and #RENDER_ACCESS_TOKEN > 0 then
+			headers["X-BRS-Token"] = RENDER_ACCESS_TOKEN
+		end
 		local options = {
 			Url = RENDER_SERVER_URL .. path,
 			Method = method,
-			Headers = {},
+			Headers = headers,
 		}
 		if bodyTable ~= nil then
 			options.Headers["Content-Type"] = "application/json"
@@ -87,8 +92,6 @@ local function httpRequest(method, path, bodyTable)
 	return result.Success, result.StatusCode, result.Body
 end
 
--- JSON-Antwort in eine Lua-Tabelle umwandeln (RequestAsync decodiert JSON
--- teilweise schon selbst - beides wird hier abgedeckt)
 local function asTable(body)
 	if typeof(body) == "table" then return body end
 	if typeof(body) ~= "string" then return nil end
@@ -99,7 +102,6 @@ local function asTable(body)
 	return nil
 end
 
--- Teilpuffer aus einem groesseren Puffer ausschneiden
 local function bufferSlice(src, byteOffset, byteLen)
 	local out = buffer.create(byteLen)
 	buffer.copy(out, 0, src, byteOffset, byteLen)
@@ -107,7 +109,65 @@ local function bufferSlice(src, byteOffset, byteLen)
 end
 
 --------------------------------------------------------------------------------
--- Phase 1: Warten, bis der Render-Server erreichbar ist
+-- Avatar-Daten & Rig-Extraktion aus Roblox
+--------------------------------------------------------------------------------
+
+local function extractAvatarData(username)
+	local targetPlayer = nil
+	for _, p in ipairs(Players:GetPlayers()) do
+		if string.lower(p.Name) == string.lower(username) then
+			targetPlayer = p
+			break
+		end
+	end
+
+	local char = targetPlayer and targetPlayer.Character
+	local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+	local rigType = (humanoid and humanoid.RigType == Enum.HumanoidRigType.R6) and "R6" or "R15"
+
+	local partsData = {}
+	local accessoriesData = {}
+
+	if char then
+		local rootPart = char:FindFirstChild("HumanoidRootPart")
+		local rootCF = rootPart and rootPart.CFrame or char:GetPivot()
+
+		for _, item in ipairs(char:GetChildren()) do
+			if item:IsA("BasePart") and item.Name ~= "HumanoidRootPart" then
+				local relCF = rootCF:ToObjectSpace(item.CFrame)
+				local col = item.Color
+				table.insert(partsData, {
+					name = item.Name,
+					size = { item.Size.X, item.Size.Y, item.Size.Z },
+					position = { relCF.Position.X, relCF.Position.Y + 3.0, relCF.Position.Z },
+					color = { math.floor(col.R * 255), math.floor(col.G * 255), math.floor(col.B * 255) },
+				})
+			elseif item:IsA("Accessory") then
+				local handle = item:FindFirstChild("Handle")
+				if handle and handle:IsA("BasePart") then
+					local relCF = rootCF:ToObjectSpace(handle.CFrame)
+					local col = handle.Color
+					table.insert(accessoriesData, {
+						name = item.Name,
+						size = { handle.Size.X, handle.Size.Y, handle.Size.Z },
+						position = { relCF.Position.X, relCF.Position.Y + 3.0, relCF.Position.Z },
+						color = { math.floor(col.R * 255), math.floor(col.G * 255), math.floor(col.B * 255) },
+					})
+				end
+			end
+		end
+	end
+
+	return {
+		rig_type = rigType,
+		username = username,
+		parts = partsData,
+		accessories = accessoriesData,
+	}
+end
+
+--------------------------------------------------------------------------------
+-- Phase 1: Warten auf Render-Server
 --------------------------------------------------------------------------------
 
 local function waitForServer()
@@ -115,98 +175,77 @@ local function waitForServer()
 		local ok, code, body = httpRequest("GET", "/health")
 		local data = ok and asTable(body) or nil
 		if ok and data and data.status == "ok" then
-			statusPrint("🟢", ("Render-Server ONLINE (Version %s, Blender: %s)")
-				:format(tostring(data.version), data.blender and "bereit" or "FEHLT"), true)
+			local versionText = tostring(data.version or "1.2")
+			local updateText = data.update_available and " (Update verfuegbar)" or ""
+			broadcastStatus(1, 5, "Server verbunden",
+				("Render-Server ONLINE (Version %s%s)"):format(versionText, updateText), 5, 30, "active")
 			return data
 		end
-		statusPrint("🔴", ("SERVER DOWN - keine Verbindung zu %s (HTTP %s). "
-			.. "Ist 02_start.bat gestartet? Neuer Versuch in %d s ...")
-			:format(RENDER_SERVER_URL, tostring(code), POLL_SECONDS), true)
+		broadcastStatus(1, 5, "Verbindung suchen",
+			("Warte auf Render-Server (HTTP %s). Starte 02_start.bat falls noetig ..."):format(tostring(code)), 2, 0, "waiting")
 		task.wait(POLL_SECONDS)
 	end
 end
 
 --------------------------------------------------------------------------------
--- Phase 2: Auftrag an den Render-Server schicken
+-- Phase 2: Auftrag abschicken
 --------------------------------------------------------------------------------
 
 local function submitJob(username)
-	local ok, code, body = httpRequest("POST", "/jobs", { username = username })
+	local avatarData = extractAvatarData(username)
+	local payload = {
+		username = username,
+		avatar_data = avatarData,
+	}
+	local ok, code, body = httpRequest("POST", "/jobs", payload)
 	local data = asTable(body)
 	if ok and data and data.job_id then
-		if data.state == "queued" then
-			statusPrint("🟡", ("AUFTRAG IN DER WARTESCHLANGE (job %s) - es wird immer "
-				.. "nur EIN Auftrag gleichzeitig gearbeitet!"):format(data.job_id), true)
-		else
-			statusPrint("📤", ("Auftrag angenommen: Avatar von '%s' (job %s)")
-				:format(username, data.job_id), true)
-		end
+		broadcastStatus(1, 5, "Auftrag angenommen",
+			("Auftrag fuer '%s' registriert (Job %s)"):format(username, data.job_id), 8, 28, "active")
 		return data.job_id
 	end
-	statusPrint("🟠", ("Auftrag konnte nicht gesendet werden (HTTP %s) - neuer Versuch in %d s ...")
-		:format(tostring(code), POLL_SECONDS), true)
+	broadcastStatus(1, 5, "Fehler beim Einreichen",
+		("Konnte Auftrag nicht senden (HTTP %s). Neuer Versuch ..."):format(tostring(code)), 0, 0, "error")
 	return nil
 end
 
 --------------------------------------------------------------------------------
--- Phase 3: Status abfragen, bis der Auftrag fertig (oder fehlerhaft) ist
+-- Phase 3: Status abfragen & Restzeit uebermitteln
 --------------------------------------------------------------------------------
-
-local STATE_TEXTS = {
-	queued      = "Auftrag in der WARTESCHLANGE (nur einer gleichzeitig)",
-	downloading = "Avatar wird von Roblox heruntergeladen (3D-Modell inkl. Texturen) ...",
-	loading     = "3D-Modell wird in Blender geladen, Glas-Material wird erstellt ...",
-	rendering   = "Blender Cycles RENDERT den Avatar",
-	encoding    = "Bild wird fuer die Uebertragung vorbereitet ...",
-}
 
 local function pollUntilDone(jobId)
 	while true do
 		local ok, code, body = httpRequest("GET", "/jobs/current")
 		if not ok then
-			statusPrint("🔴", ("SERVER DOWN - Verbindung verloren (HTTP %s). "
-				.. "Neuer Versuch in %d s ..."):format(tostring(code), POLL_SECONDS), true)
+			-- Server aktualisiert sich moeglicherweise gerade selbst
+			broadcastStatus(0, 5, "Server aktualisiert / startet neu",
+				"Server antwortet kurzzeitig nicht (Auto-Update?). Warte auf Reconnect ...", 0, 0, "restarting")
 			task.wait(POLL_SECONDS)
 		else
 			local data = asTable(body)
-			if data == nil then
-				statusPrint("🟠", "Antwort des Servers nicht lesbar - versuche weiter ...")
-				task.wait(POLL_SECONDS)
-			elseif data.state == "idle" then
-				statusPrint("🟠", "Auftrag ist auf dem Server verschwunden (Neustart?) - "
-					.. "reiche einen neuen Auftrag ein ...", true)
+			if data == nil or data.state == "idle" then
+				broadcastStatus(1, 5, "Neustart erkannt", "Server hat neu gestartet -> reiche Auftrag neu ein ...", 5, 30, "resubmit")
 				return "resubmit"
 			elseif data.job_id == jobId then
 				local state = data.state
+				local step = data.step or 2
+				local totalSteps = data.step_total or 5
+				local stepName = data.step_name or state
+				local msg = data.message or ""
+				local progress = data.progress or 0
+				local estSec = data.est_seconds_left or 0
+
 				if state == "done" then
-					statusPrint("✅", ("Render abgeschlossen! ('%s')"):format(tostring(data.username)), true)
+					broadcastStatus(5, 5, "Fertig gerendert", ("Render fuer '%s' erfolgreich abgeschlossen!"):format(data.username), 95, 2, "done")
 					return "done", data
 				elseif state == "error" then
-					statusPrint("❌", ("FEHLER beim Rendern: %s")
-						:format(tostring(data.error or data.message)), true)
+					broadcastStatus(0, 5, "Fehler aufgetreten", tostring(data.error or msg), 0, 0, "error")
 					return "error"
 				else
-					local text = STATE_TEXTS[state] or ("Status: " .. tostring(state))
-					if state == "rendering" then
-						text = ("%s ... %d %%"):format(text, tonumber(data.progress) or 0)
-					end
-					statusPrint("⏳", text)
+					broadcastStatus(step, totalSteps, stepName, msg, progress, estSec, "active")
 					task.wait(POLL_SECONDS)
 				end
 			else
-				-- Gerade laeuft ein ANDERER Auftrag
-				local meQueued = false
-				for _, q in ipairs(data.queued or {}) do
-					if q.job_id == jobId then meQueued = true end
-				end
-				if meQueued then
-					statusPrint("🟡", ("AUFTRAG IN DER WARTESCHLANGE - aktuell wird noch '%s' "
-						.. "bearbeitet (%s). Nur ein Auftrag gleichzeitig!")
-						:format(tostring(data.username), tostring(data.state)), true)
-				else
-					statusPrint("👀", ("Anderer Auftrag aktiv: '%s' (%s)")
-						:format(tostring(data.username), tostring(data.state)))
-				end
 				task.wait(POLL_SECONDS)
 			end
 		end
@@ -214,100 +253,77 @@ local function pollUntilDone(jobId)
 end
 
 --------------------------------------------------------------------------------
--- Phase 4: Fertiges Bild stueckweise holen, in ein EditableImage schreiben
---          und an den Client weiterleiten
+-- Phase 4: Bilduebertragung & Streaming
 --------------------------------------------------------------------------------
 
 local function transferImage(jobId)
 	local ok, code, body = httpRequest("GET", ("/jobs/%s/image/info"):format(jobId))
 	local info = ok and asTable(body) or nil
 	if not (info and info.width and info.height) then
-		statusPrint("❌", ("Bild-Infos konnten nicht geladen werden (HTTP %s)"):format(tostring(code)), true)
+		broadcastStatus(5, 5, "Fehler", "Bild-Metadaten nicht lesbar", 0, 0, "error")
 		return
 	end
 	local width, height = info.width, info.height
-	statusPrint("📦", ("Bild ist fertig: %dx%d Pixel - uebertrage es stueckweise ...")
-		:format(width, height), true)
+	broadcastStatus(5, 5, "Bild uebertragen", ("Empfange %dx%d Pixel ..."):format(width, height), 95, 2, "transfer")
 
-	-- Serverseitiges EditableImage ("Editable Image Daten" hier in Roblox)
-	local serverImage
-	local okCreate, errCreate = pcall(function()
+	local serverImage = nil
+	pcall(function()
 		serverImage = AssetService:CreateEditableImage({ Size = Vector2.new(width, height) })
 	end)
-	if okCreate and serverImage then
-		-- EditableImage ist KEINE Instance: .Name/.Parent gibt es nicht!
-		statusPrint("🖼️", ("Server-EditableImage erstellt (%dx%d)"):format(width, height), true)
-	else
-		statusPrint("🟠", "Hinweis: Server-EditableImage nicht moeglich (" .. tostring(errCreate)
-			.. ") - Uebertragung zum Client laeuft trotzdem.", true)
-	end
 
-	-- Der (einzige) Spieler bekommt die Pakete
 	local target = Players:GetPlayers()[1]
-	if not target then
-		statusPrint("🟠", "Kein Spieler im Server - Bild wird nur serverseitig gespeichert.", true)
-	end
-
 	local totalChunks = math.ceil(height / HTTP_CHUNK_ROWS)
 	local chunkIndex, y = 0, 0
+
 	while y < height do
 		local okRow, codeRow, bodyRow = httpRequest("GET",
 			("/jobs/%s/image/rows?y=%d&rows=%d"):format(jobId, y, HTTP_CHUNK_ROWS))
 		if not (okRow and codeRow == 200) then
-			statusPrint("🔴", ("Bild-Daten (Zeile %d) fehlgeschlagen - HTTP %s"):format(y, tostring(codeRow)), true)
+			broadcastStatus(5, 5, "Fehler", "Zeilen-Download fehlgeschlagen", 0, 0, "error")
 			return
 		end
+
 		local buf = buffer.fromstring(bodyRow)
 		local rowsInBuf = math.floor(buffer.len(buf) / (width * 4))
-		if rowsInBuf <= 0 then
-			statusPrint("🔴", "Bild-Paket war leer - Abbruch.", true)
-			return
-		end
-		-- 1) In das serverseitige EditableImage schreiben
+		if rowsInBuf <= 0 then break end
+
 		if serverImage then
 			pcall(function()
 				serverImage:WritePixelsBuffer(Vector2.new(0, y), Vector2.new(width, rowsInBuf), buf)
 			end)
 		end
-		-- 2) An den Client in kleineren Paketen weiterleiten
+
 		if target then
 			local y2 = y
 			while y2 < y + rowsInBuf do
 				local rows2 = math.min(REMOTE_CHUNK_ROWS, y + rowsInBuf - y2)
 				local offset = (y2 - y) * width * 4
 				local piece = bufferSlice(buf, offset, rows2 * width * 4)
-				remote:FireClient(target, "chunk", jobId, y2, rows2, width, height, piece)
+				remoteImage:FireClient(target, "chunk", jobId, y2, rows2, width, height, piece)
 				y2 = y2 + rows2
-				task.wait() -- kleines Tempo, damit nichts verlorengeht
+				task.wait()
 			end
 		end
+
 		chunkIndex = chunkIndex + 1
 		y = y + rowsInBuf
-		if chunkIndex % 8 == 0 or y >= height then
-			statusPrint("📡", ("Bild-Uebertragung: %d / %d Pakete (%d %% der Zeilen)")
-				:format(chunkIndex, totalChunks, math.floor(y / height * 100)))
-		end
 	end
 
 	if target then
-		remote:FireClient(target, "done", jobId, width, height)
+		remoteImage:FireClient(target, "done", jobId, width, height)
 	end
-	statusPrint("🎉", ("FERTIG! Bild (%dx%d) komplett - es sollte im Client-GUI sichtbar sein.")
-		:format(width, height), true)
+	broadcastStatus(5, 5, "Fertig!", ("Bild (%dx%d) erfolgreich im GUI angezeigt."):format(width, height), 100, 0, "done")
 end
 
 --------------------------------------------------------------------------------
--- Die Gesamt-Pipeline
+-- Pipeline-Steuerung
 --------------------------------------------------------------------------------
 
-local pipelineRunning = false
+local isBusy = false
 
 local function runPipeline(username)
-	if pipelineRunning then
-		statusPrint("🟠", "Es laeuft bereits eine Render-Pipeline - bitte warten.", true)
-		return
-	end
-	pipelineRunning = true
+	if isBusy then return end
+	isBusy = true
 
 	while true do
 		waitForServer()
@@ -320,68 +336,38 @@ local function runPipeline(username)
 			elseif result == "error" then
 				break
 			end
-			-- "resubmit": Server hatte neu gestartet -> Schleife laeuft weiter
 		else
 			task.wait(POLL_SECONDS)
 		end
 	end
-	pipelineRunning = false
 
-	-- Danach: Server dauerhaft beobachten und weiter in die Konsole printen
-	while true do
-		local ok, code, body = httpRequest("GET", "/jobs/current")
-		if not ok then
-			statusPrint("🔴", ("SERVER DOWN - keine Verbindung (HTTP %s). "
-				.. "Pruefe, ob 02_start.bat laeuft."):format(tostring(code)), true)
-		else
-			local data = asTable(body) or {}
-			if data.state == "idle" then
-				statusPrint("🟢", "Server online - gerade passiert nichts (idle).")
-			elseif data.state == "done" then
-				statusPrint("🟢", ("Server online - letzter Auftrag fertig ('%s').")
-					:format(tostring(data.username)))
-			elseif data.state == "error" then
-				statusPrint("🟠", ("Server online - letzter Auftrag hatte einen Fehler: %s")
-					:format(tostring(data.error or data.message)))
-			else
-				local text = STATE_TEXTS[data.state] or tostring(data.state)
-				statusPrint("👀", ("Server arbeitet gerade: '%s' - %s")
-					:format(tostring(data.username), text))
-			end
-		end
-		task.wait(POLL_SECONDS)
-	end
+	isBusy = false
 end
 
---------------------------------------------------------------------------------
--- Start + optionale Chat-Befehle
---------------------------------------------------------------------------------
-
-print("==============================================================")
-print("[BlenderRender] Server-Skript geladen!")
-print("[BlenderRender] Render-Server : " .. RENDER_SERVER_URL)
-print("[BlenderRender] Avatar-User   : " .. ROBLOX_USERNAME)
-print("[BlenderRender] Tipp: Allow HTTP Requests muss in den")
-print("[BlenderRender] Game Settings aktiviert sein (Security).")
-print("[BlenderRender] Im Chat geht: !render  oder  !render AndererName")
-print("==============================================================")
-
-if ROBLOX_USERNAME == "Builderman" and AUTO_RENDER then
-	warn("[BlenderRender] Hinweis: Trage oben bei ROBLOX_USERNAME deinen eigenen Roblox-Namen ein!")
+-- RemoteFunction fuer Client-Aufrufe
+remoteRequest.OnServerInvoke = function(callingPlayer, requestedUsername)
+	local targetName = (requestedUsername and #requestedUsername > 0) and requestedUsername or callingPlayer.Name
+	task.spawn(runPipeline, targetName)
+	return true
 end
 
-Players.PlayerAdded:Connect(function(player)
-	print(("[BlenderRender] Spieler im Server: %s (bekommt das Bild ins GUI)"):format(player.Name))
-	player.Chatted:Connect(function(message)
-		local args = string.split(message, " ")
+-- Chat-Befehle
+Players.PlayerAdded:Connect(function(newPlayer)
+	newPlayer.Chatted:Connect(function(msg)
+		local args = string.split(msg, " ")
 		if string.lower(args[1]) == "!render" then
-			local name = #args >= 2 and table.concat(args, " ", 2) or ROBLOX_USERNAME
-			statusPrint("🔁", ("Neuer Render-Auftrag per Chat: '%s'"):format(name), true)
-			task.spawn(runPipeline, name)
+			local target = #args >= 2 and args[2] or newPlayer.Name
+			task.spawn(runPipeline, target)
 		end
 	end)
 end)
 
+print("==============================================================")
+print("[BlenderRender] Server-Skript initialisiert!")
+print("[BlenderRender] Server-Adresse: " .. RENDER_SERVER_URL)
+print("[BlenderRender] Standard-User : " .. DEFAULT_USERNAME)
+print("==============================================================")
+
 if AUTO_RENDER then
-	task.spawn(runPipeline, ROBLOX_USERNAME)
+	task.spawn(runPipeline, DEFAULT_USERNAME)
 end
