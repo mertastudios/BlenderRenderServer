@@ -1,0 +1,9 @@
+# Lokale Installation & Daten (nie ins Repository)
+venv/
+tools/
+data/
+logs/
+.update/
+__pycache__/
+*.pyc
+.env
