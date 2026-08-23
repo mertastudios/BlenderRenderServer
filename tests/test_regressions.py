@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -96,6 +97,77 @@ class ManifestFetchTests(unittest.TestCase):
                     avatar.fetch_3d_manifest(session, 1)
         self.assertIn("HTTP 400", str(ctx.exception))
         self.assertLess(session.get.call_count, 10)
+
+
+class MtlFixupTests(unittest.TestCase):
+    """Die OBJ-Warnungen aus dem Server-Log ("map_Ka not supported" und
+    "Cannot load image file ... ohne Endung") duerfen nicht mehr auftreten."""
+
+    def test_appends_png_extension(self):
+        out = avatar._rewrite_mtl("map_Kd 30DAY-abc", ["30DAY-abc.png"])
+        self.assertIn("map_Kd 30DAY-abc.png", out)
+
+    def test_map_ka_becomes_map_kd(self):
+        out = avatar._rewrite_mtl("map_Ka 30DAY-abc", ["30DAY-abc.png"])
+        self.assertNotIn("map_Ka", out)
+        self.assertNotIn("map_Ka 30DAY-abc\n", out)
+        self.assertIn("map_Kd 30DAY-abc.png", out)
+
+    def test_existing_extensions_are_kept(self):
+        out = avatar._rewrite_mtl("map_Kd tex.png", ["tex.png"])
+        self.assertIn("map_Kd tex.png", out)
+
+    def test_options_numbers_and_paths(self):
+        out = avatar._rewrite_mtl("map_d -s 1 1 1 some/dir/Tex", ["tex.png"])
+        self.assertIn("-s 1 1 1", out)
+        self.assertIn("tex.png", out)
+        self.assertNotIn("some/dir/Tex", out)
+
+    def test_comments_and_plain_lines_stay_unchanged(self):
+        mtl = "# Kommentar von Roblox\nnewmtl m\nKd 1 1 1\nillum 2\n"
+        out = avatar._rewrite_mtl(mtl, ["x.png"])
+        self.assertIn("# Kommentar von Roblox", out)
+        self.assertIn("newmtl m", out)
+        self.assertIn("Kd 1 1 1", out)
+        self.assertIn("illum 2", out)
+
+    def test_unknown_refs_are_left_as_is(self):
+        out = avatar._rewrite_mtl("map_Kd fehlt", ["andere.png"])
+        self.assertIn("map_Kd fehlt", out)
+
+
+class DownloadAvatarModelTests(unittest.TestCase):
+    def _run(self, tmp: str, obj_bytes: bytes):
+        def fake_cdn(_session, _host, name):
+            if name == "objhash":
+                return obj_bytes
+            if name == "mtlhash":
+                return b"newmtl m\nmap_Ka 30DAY-tex\nmap_Kd 30DAY-tex\n"
+            return b"PNGDATA"
+
+        with patch.object(avatar, "resolve_user_id", return_value=42), \
+             patch.object(avatar, "fetch_3d_manifest", return_value=(
+                 {"obj": "objhash", "mtl": "mtlhash", "textures": ["30DAY-tex"]},
+                 "t3.rbxcdn.com")), \
+             patch.object(avatar, "_download_cdn", side_effect=fake_cdn):
+            return avatar.download_avatar_model("MertaStudios", Path(tmp))
+
+    def test_mtl_on_disk_matches_saved_texture_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            info = self._run(tmp, b"v 0 0 0\nf 1 1 1\n")
+            self.assertTrue((Path(tmp) / "30DAY-tex.png").exists())
+            mtl = (Path(tmp) / "avatar.mtl").read_text(encoding="utf-8")
+            self.assertNotIn("map_Ka", mtl)
+            self.assertIn("map_Kd 30DAY-tex.png", mtl)
+            self.assertEqual(info["textures"], ["30DAY-tex.png"])
+
+    def test_obj_gets_exactly_one_mtllib_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._run(tmp, b"mtllib irgendeinhash\nv 0 0 0\n")
+            obj = (Path(tmp) / "avatar.obj").read_text(encoding="utf-8")
+            self.assertTrue(obj.startswith("mtllib avatar.mtl\n"))
+            self.assertNotIn("irgendeinhash", obj)
+            self.assertEqual(obj.count("mtllib"), 1)
 
 
 class UpdaterTests(unittest.TestCase):
