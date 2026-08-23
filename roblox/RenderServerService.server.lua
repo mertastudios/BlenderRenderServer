@@ -33,7 +33,6 @@ local HttpService    = game:GetService("HttpService")
 local AssetService   = game:GetService("AssetService")
 local Players        = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local ServerStorage  = game:GetService("ServerStorage")
 local RunService     = game:GetService("RunService")
 
 --========================= KONFIGURATION =====================================
@@ -260,8 +259,8 @@ local function transferImage(jobId)
 		serverImage = AssetService:CreateEditableImage({ Size = Vector2.new(width, height) })
 	end)
 	if okCreate and serverImage then
-		serverImage.Name = "BRS_Render_" .. jobId
-		serverImage.Parent = ServerStorage
+		-- WICHTIG: EditableImage ist KEINE Instance - .Name/.Parent existieren
+		-- dort nicht und wuerden die Uebertragung mit einem Fehler abbrechen!
 		statusPrint("🖼️", ("Server-EditableImage erstellt (%dx%d)"):format(width, height), true)
 	else
 		statusPrint("🟠", "Hinweis: Server-EditableImage nicht moeglich (" .. tostring(errCreate)

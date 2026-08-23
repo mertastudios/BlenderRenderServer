@@ -332,6 +332,53 @@ def _mtl_texture_refs(mtl_text: str) -> list[str]:
     return unique
 
 
+def _rewrite_mtl(mtl_text: str, saved_names: list[str]) -> str:
+    """Passt eine Roblox-MTL-Datei an, damit Blenders OBJ-Importer klarkommt.
+
+    Zwei Probleme aus der Praxis (siehe Server-Log):
+      * Roblox referenziert Texturen ohne Dateiendung ("map_Kd 30DAY-abc"),
+        die Datei liegt aber als "30DAY-abc.png" im Modell-Ordner ->
+        Blender meldet "Cannot load image file: ...30DAY-abc".
+        Hier werden Referenzen auf die tatsaechlich gespeicherten Dateinamen
+        gemappt (case-insensitive, auch ohne/mit Endung und mit Pfad davor).
+      * "map_Ka" (ambient) unterstuetzt Blender nicht ->
+        "MTL texture map type not supported". map_Ka wird deshalb zu map_Kd
+        konvertiert, damit die Textur wenigstens geladen wird.
+    Optionen (-s 1 1 1 usw.), Zahlen und Kommentarzeilen bleiben unangetastet.
+    """
+    by_lower = {name.lower(): name for name in saved_names}
+
+    def resolve(token: str) -> str:
+        base = token.replace("\\", "/").rsplit("/", 1)[-1]
+        hit = by_lower.get(base.lower())
+        if hit is None and "." not in base:
+            hit = by_lower.get(f"{base}.png".lower())
+        return hit if hit is not None else token
+
+    out_lines: list[str] = []
+    for line in mtl_text.splitlines():
+        parts = line.split()
+        if not parts:
+            out_lines.append(line)
+            continue
+        keyword = parts[0]
+        lower = keyword.lower()
+        if lower == "map_ka":
+            keyword = "map_Kd"
+            lower = "map_kd"
+        if lower.startswith("map_") or lower in ("bump", "norm", "disp", "refl"):
+            tokens = [keyword]
+            for token in parts[1:]:
+                if token.startswith("-") or re.fullmatch(r"\d+(\.\d+)?", token):
+                    tokens.append(token)
+                else:
+                    tokens.append(resolve(token))
+            out_lines.append(" ".join(tokens))
+        else:
+            out_lines.append(line)
+    return "\n".join(out_lines) + "\n"
+
+
 # ------------------------------------------------------------------------------
 #  Oeffentliche Hauptfunktion
 # ------------------------------------------------------------------------------
@@ -387,11 +434,16 @@ def download_avatar_model(username: str, dest_dir: Path) -> dict:
         print(f"[Avatar] Textur geladen: {base} ({len(data) // 1024} KB)")
 
     obj_text = obj_data.decode("utf-8", "replace")
-    if "mtllib" not in obj_text:
-        obj_text = "mtllib avatar.mtl\n" + obj_text
+    # GENAU EINE mtllib-Zeile auf avatar.mtl setzen. (Roblox-OBJs enthalten
+    # teilweise "mtllib <hash>", diese Datei existiert im Ordner aber nicht.)
+    body = [ln for ln in obj_text.splitlines() if not ln.strip().lower().startswith("mtllib")]
+    obj_text = "mtllib avatar.mtl\n" + "\n".join(body) + "\n"
     (dest_dir / "avatar.obj").write_text(obj_text, encoding="utf-8")
     if mtl_data:
-        (dest_dir / "avatar.mtl").write_bytes(mtl_data)
+        # MTL erst anpassen (Endungen + map_Ka), damit Blender die Texturen
+        # findet und keine Warnungen mehr produziert - siehe _rewrite_mtl.
+        mtl_text = _rewrite_mtl(mtl_data.decode("utf-8", "replace"), texture_files)
+        (dest_dir / "avatar.mtl").write_text(mtl_text, encoding="utf-8")
 
     return {
         "user_id": user_id,
