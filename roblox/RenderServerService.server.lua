@@ -19,6 +19,11 @@
 --    Home → Game Settings → Security → "Allow HTTP Requests" = ON
 --    (Ohne das darf Roblox nicht mit deinem PC reden.)
 --
+--  VEROEFFENTLICHEN:
+--    localhost geht NUR in Studio auf demselben PC.
+--    Fuer den echten Roblox-Client: 08_oeffentliche_adresse.bat
+--    und die https-URL unten bei RENDER_SERVER_URL eintragen.
+--
 --  ZUSAETZLICH MOEGLICH (im Chat, nur zum Testen):
 --    !render              → startet den Avatar-Render erneut
 --    !render Benutzername → rendert einen anderen Avatar
@@ -29,11 +34,23 @@ local AssetService   = game:GetService("AssetService")
 local Players        = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ServerStorage  = game:GetService("ServerStorage")
+local RunService     = game:GetService("RunService")
 
 --========================= KONFIGURATION =====================================
--- Adresse deines Render-Servers. "localhost" = gleicher PC wie Studio.
--- Anderer PC im selben Netzwerk? Dann z.B. "http://192.168.1.50:8000"
+-- STUDIO auf demselben PC wie der Render-Server:
+--   local RENDER_SERVER_URL = "http://localhost:8000"
+--
+-- VEROEFFENTLICHTES Spiel (Roblox-Client, nicht Studio):
+--   localhost funktioniert NICHT! Die Anfrage kommt von Roblox-Cloud-Servern.
+--   1. Auf dem PC 02_start.bat UND 08_oeffentliche_adresse.bat starten
+--   2. Die https://....trycloudflare.com Adresse HIER eintragen
+--   3. Im Live-Spiel braucht Roblox HTTPS (nicht http://)
+--   4. Dein PC muss an sein, solange jemand spielt
 local RENDER_SERVER_URL = "http://localhost:8000"
+
+-- Nur noetig, wenn in der .env BRS_ACCESS_TOKEN gesetzt ist (empfohlen
+-- sobald die Adresse oeffentlich ist). Muss EXAKT derselbe Wert sein.
+local RENDER_ACCESS_TOKEN = ""
 
 -- Der Roblox-Benutzername, dessen Avatar beim Serverstart gerendert wird:
 local ROBLOX_USERNAME = "Builderman" -- <<< HIER DEINEN NAMEN EINTRAGEN!
@@ -75,6 +92,9 @@ local function httpRequest(method, path, bodyTable)
 			Method = method,
 			Headers = {},
 		}
+		if RENDER_ACCESS_TOKEN ~= "" then
+			options.Headers["X-BRS-Token"] = RENDER_ACCESS_TOKEN
+		end
 		if bodyTable ~= nil then
 			options.Headers["Content-Type"] = "application/json"
 			options.Body = HttpService:JSONEncode(bodyTable)
@@ -143,8 +163,13 @@ local function submitJob(username)
 		end
 		return data.job_id
 	end
-	statusPrint("🟠", ("Auftrag konnte nicht gesendet werden (HTTP %s) - neuer Versuch in %d s ...")
-		:format(tostring(code), POLL_SECONDS), true)
+	if tonumber(code) == 401 then
+		statusPrint("🟠", "Zugangstoken abgelehnt (HTTP 401). RENDER_ACCESS_TOKEN im Skript muss "
+			.. "genau BRS_ACCESS_TOKEN aus der .env sein.", true)
+	else
+		statusPrint("🟠", ("Auftrag konnte nicht gesendet werden (HTTP %s) - neuer Versuch in %d s ...")
+			:format(tostring(code), POLL_SECONDS), true)
+	end
 	return nil
 end
 
@@ -366,6 +391,18 @@ print("[BlenderRender] Tipp: Allow HTTP Requests muss in den")
 print("[BlenderRender] Game Settings aktiviert sein (Security).")
 print("[BlenderRender] Im Chat geht: !render  oder  !render AndererName")
 print("==============================================================")
+
+do
+	local url = string.lower(RENDER_SERVER_URL)
+	local isLocal = string.find(url, "localhost", 1, true) or string.find(url, "127.0.0.1", 1, true)
+	if not RunService:IsStudio() and isLocal then
+		warn("[BlenderRender] FEHLER: localhost funktioniert NICHT im veroeffentlichten Spiel!")
+		warn("[BlenderRender] Die Anfrage kommt von Roblox-Servern, nicht von deinem PC.")
+		warn("[BlenderRender] Loesung: 08_oeffentliche_adresse.bat starten und die https://... URL hier bei RENDER_SERVER_URL eintragen.")
+	elseif not RunService:IsStudio() and string.sub(url, 1, 8) ~= "https://" then
+		warn("[BlenderRender] Hinweis: Im veroeffentlichten Spiel braucht Roblox HTTPS (nicht http://).")
+	end
+end
 
 if ROBLOX_USERNAME == "Builderman" and AUTO_RENDER then
 	warn("[BlenderRender] Hinweis: Trage oben bei ROBLOX_USERNAME deinen eigenen Roblox-Namen ein!")

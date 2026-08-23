@@ -40,8 +40,12 @@ eingerichtet sein und laufen (siehe `ANLEITUNG.md` im Hauptordner).
    local ROBLOX_USERNAME   = "DeinRobloxName"         -- <<< DEIN NAME!
    ```
    - `RENDER_SERVER_URL`: bleibt `http://localhost:8000`, wenn Studio auf
-     demselben PC läuft wie der Render-Server. (Anderes Gerät? Siehe
-     `ANLEITUNG.md`, Abschnitt 8.)
+     demselben PC läuft wie der Render-Server. **Für ein veröffentlichtes
+     Spiel reicht das nicht** – dann `08_oeffentliche_adresse.bat` starten
+     und die `https://....trycloudflare.com` URL hier eintragen
+     (siehe `ANLEITUNG.md`, Abschnitt 8b).
+   - `RENDER_ACCESS_TOKEN`: nur nötig, wenn in der `.env` `BRS_ACCESS_TOKEN`
+     gesetzt ist. Dann **derselbe** Wert.
    - `ROBLOX_USERNAME`: der Avatar, der gerendert wird.
 7. Bennene das Skript um in `BlenderRenderServer` (Doppelklick auf den Namen
    im Explorer) – hilft, den Überblick zu behalten.

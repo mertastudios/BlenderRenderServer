@@ -67,9 +67,22 @@ PORT = get_int("BRS_PORT", 8000)
 # ------------------------------------------------------------------------------
 #  Roblox
 # ------------------------------------------------------------------------------
-# Optionaler Roblox Open Cloud API-Key (asset-legacy-delivery / asset-delivery).
-# Ohne Key funktioniert das System ueber die oeffentlichen Roblox-Endpunkte.
+# Open-Cloud-API-Key. Seit 23. Maerz 2026 PFLICHT fuer den 3D-Avatar-Download
+# (Recht "thumbnails: Read"). Ohne Key antwortet Roblox mit HTTP 401/403.
+# Optional zusaetzlich: "asset-legacy-delivery: Read" als Ausweichweg.
 ROBLOX_API_KEY = get("ROBLOX_API_KEY", "").strip()
+
+# ------------------------------------------------------------------------------
+#  Veroeffentlichte Spiele / Sicherheit
+# ------------------------------------------------------------------------------
+# Feste oeffentliche Basis-URL (https://...), falls du selbst hostest.
+# Ein laufender Cloudflare-Tunnel (08_oeffentliche_adresse.bat) hat Vorrang.
+PUBLIC_URL = get("PUBLIC_URL", "").strip().rstrip("/")
+# true = beim Serverstart automatisch einen Cloudflare-Quick-Tunnel oeffnen
+PUBLIC_TUNNEL = get_bool("BRS_PUBLIC_TUNNEL", False)
+# Gemeinsames Geheimnis. Wenn gesetzt, muessen /jobs-Anfragen den Header
+# X-BRS-Token mitschicken (im Lua-Skript: RENDER_ACCESS_TOKEN).
+BRS_ACCESS_TOKEN = get("BRS_ACCESS_TOKEN", "").strip()
 
 # ------------------------------------------------------------------------------
 #  Blender / Rendering
@@ -127,4 +140,6 @@ def summary() -> dict:
         "api_key_set": bool(ROBLOX_API_KEY),
         "auto_update": AUTO_UPDATE,
         "test_mode": TEST_MODE,
+        "public_url": PUBLIC_URL,
+        "access_token_set": bool(BRS_ACCESS_TOKEN),
     }

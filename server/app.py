@@ -20,14 +20,49 @@ import time
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Response
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from PIL import Image
 from pydantic import BaseModel
 
-from . import avatar, blender_runner, config, updater
+from . import avatar, blender_runner, config, diagnostics, tunnel, updater
 
-app = FastAPI(title="BlenderRenderServer", version="1.0")
+app = FastAPI(title="BlenderRenderServer", version="1.1")
+
+# Pfade, die ohne Token erreichbar bleiben (Statusseite, Health, Diagnose).
+_OPEN_PATHS = {"/", "/health", "/diagnostics", "/favicon.ico"}
+
+
+def _request_token(request: Request) -> str:
+    header = (request.headers.get("x-brs-token") or "").strip()
+    if header:
+        return header
+    auth = (request.headers.get("authorization") or "").strip()
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return (request.query_params.get("token") or "").strip()
+
+
+@app.middleware("http")
+async def _protect_jobs(request: Request, call_next):
+    expected = config.BRS_ACCESS_TOKEN
+    if not expected:
+        return await call_next(request)
+    path = request.url.path
+    if path in _OPEN_PATHS or path.startswith("/docs") or path.startswith("/openapi"):
+        return await call_next(request)
+    if _request_token(request) != expected:
+        return JSONResponse(
+            {
+                "detail": (
+                    "Ungueltiger oder fehlender Zugangstoken. "
+                    "Im Lua-Skript RENDER_ACCESS_TOKEN auf denselben Wert "
+                    "setzen wie BRS_ACCESS_TOKEN in der .env."
+                )
+            },
+            status_code=401,
+        )
+    return await call_next(request)
 
 ACTIVE_STATES = {"queued", "downloading", "loading", "rendering", "encoding"}
 STATE_LABELS = {
@@ -249,10 +284,29 @@ def _on_startup() -> None:
     config.ensure_dirs()
     print("=" * 62, flush=True)
     print(f"  BlenderRenderServer ist ONLINE  (Version {config.version()})", flush=True)
-    print(f"  Adresse: http://localhost:{config.PORT}", flush=True)
+    print(f"  Studio-Adresse : http://localhost:{config.PORT}", flush=True)
+    pub = tunnel.public_url()
+    if pub:
+        print(f"  Oeffentliche URL: {pub}", flush=True)
+    else:
+        print("  Oeffentliche URL: (keine - fuer Live-Spiele 08_oeffentliche_adresse.bat)", flush=True)
     print(f"  Blender: {'gefunden' if blender_runner.blender_available() else 'NICHT gefunden!'}"
           "   |   Modus: " + ("TEST-MODUS" if config.TEST_MODE else "normal"), flush=True)
+    print(f"  API-Key: {'gesetzt' if config.ROBLOX_API_KEY else 'FEHLT (3D-Avatare brauchen ihn!)'}", flush=True)
     print("=" * 62, flush=True)
+    if not config.TEST_MODE and not config.ROBLOX_API_KEY:
+        print("!" * 62, flush=True)
+        print("  KEIN ROBLOX_API_KEY in der .env!", flush=True)
+        print("  Seit Maerz 2026 blockiert Roblox den 3D-Avatar-Download", flush=True)
+        print("  ohne Open-Cloud-Key (Recht: thumbnails -> Read).", flush=True)
+        print("  Ohne Key kommt HTTP 401/403. Anleitung: ANLEITUNG.md §9", flush=True)
+        print("!" * 62, flush=True)
+    if config.PUBLIC_TUNNEL:
+        try:
+            tunnel.start_in_background()
+            print("[Tunnel] Cloudflare-Tunnel wird im Hintergrund gestartet ...", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[Tunnel] Konnte nicht starten: {exc}", flush=True)
     if config.AUTO_UPDATE:
         threading.Thread(target=_update_loop, daemon=True, name="brs-updater").start()
 
@@ -263,13 +317,30 @@ def _on_startup() -> None:
 
 @app.get("/health")
 def health() -> dict:
+    pub = tunnel.public_url()
     return {
         "status": "ok",
         "version": config.version(),
         "blender": blender_runner.blender_available(),
         "test_mode": config.TEST_MODE,
         "api_key_set": bool(config.ROBLOX_API_KEY),
+        "access_token_set": bool(config.BRS_ACCESS_TOKEN),
+        "studio_url": f"http://localhost:{config.PORT}",
+        "public_url": pub or None,
         "current_state": (MANAGER.current() or {}).get("state", "idle"),
+    }
+
+
+@app.get("/diagnostics")
+def diagnostics_endpoint() -> dict:
+    checks = diagnostics.run_checks()
+    return {
+        "status": "ok" if all(
+            c["ok"] or "GitHub" in c["name"] or "Oeffentliche" in c["name"]
+            for c in checks
+        ) else "problems",
+        "checks": checks,
+        "text": diagnostics.as_text(checks),
     }
 
 
@@ -379,6 +450,23 @@ def index() -> str:
         img = f'<img src="/jobs/{job_id}/image.png" alt="Render">' \
               f'<p><a href="/jobs/{job_id}/image.png" target="_blank">Bild in Originalgroesse &ouml;ffnen</a></p>'
     color = {"done": "#2ecc71", "error": "#e74c3c", "idle": "#7f8c8d"}.get(state, "#f39c12")
+    pub = tunnel.public_url()
+    warn = ""
+    if not config.TEST_MODE and not config.ROBLOX_API_KEY:
+        warn += (
+            '<p class="warn">Kein ROBLOX_API_KEY gesetzt. Seit Maerz 2026 braucht der '
+            "3D-Avatar-Download (OBJ + Texturen, kein Profilbild) einen Open-Cloud-Key "
+            "mit Recht <code>thumbnails: Read</code>. Siehe ANLEITUNG.md Abschnitt 9.</p>"
+        )
+    if pub:
+        warn += f'<p class="info">Oeffentliche URL fuer Live-Spiele: <code>{pub}</code></p>'
+    else:
+        warn += (
+            '<p class="info">Studio: <code>http://localhost:'
+            f"{config.PORT}</code> &nbsp;|&nbsp; Veroeffentlichtes Spiel: "
+            "<code>08_oeffentliche_adresse.bat</code> starten und die https-URL "
+            "im Lua-Skript eintragen.</p>"
+        )
     return f"""<!doctype html><html lang="de"><head><meta charset="utf-8">
 <meta http-equiv="refresh" content="5"><title>Blender Render Server</title>
 <style>body{{font-family:system-ui,Segoe UI,Arial;background:#14161a;color:#eee;
@@ -387,12 +475,19 @@ h1{{font-size:1.6rem}} .box{{background:#1f232b;border-radius:12px;padding:24px 
 max-width:640px;text-align:center}} .state{{color:{color};font-size:1.3rem;font-weight:600}}
 .bar{{height:10px;background:#2b313c;border-radius:6px;margin:16px 0;overflow:hidden}}
 .fill{{height:100%;width:{progress}%;background:linear-gradient(90deg,#3498db,#2ecc71)}} img{{max-width:100%;
-border-radius:8px}} a{{color:#3498db}}</style></head><body>
+border-radius:8px}} a{{color:#3498db}}
+.warn{{background:#3a2424;color:#f5c2c2;padding:10px 12px;border-radius:8px;font-size:0.9rem;text-align:left}}
+.info{{background:#243044;color:#c5d4ea;padding:10px 12px;border-radius:8px;font-size:0.85rem;text-align:left}}
+code{{color:#9cdcfe}}</style></head><body>
 <h1>&#129482; Blender Render Server</h1>
 <div class="box">
 <p class="state">{state}</p><p>{msg}</p>
 <div class="bar"><div class="fill"></div></div>
+{warn}
 {img}
 <p style="color:#8892a4;font-size:0.85rem">Version {config.version()} &middot;
-Test-Modus: {'an' if config.TEST_MODE else 'aus'} &middot; Diese Seite aktualisiert sich alle 5 s selbst.</p>
+Test-Modus: {'an' if config.TEST_MODE else 'aus'} &middot;
+API-Key: {'ja' if config.ROBLOX_API_KEY else 'fehlt'} &middot;
+<a href="/diagnostics">Verbindungscheck</a> &middot;
+Diese Seite aktualisiert sich alle 5 s selbst.</p>
 </div></body></html>"""

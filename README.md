@@ -28,6 +28,8 @@ Das System besteht aus zwei Teilen:
 - **Nur ein Auftrag gleichzeitig** (+ maximal einer in der Warteschlange) – immer klar, was gerade passiert
 - **Roblox-Integration**: fertiges Bild wird stückweise als **EditableImage**-Pixelpuffer an Roblox übertragen und dort per RemoteEvent im Client in einem GUI angezeigt
 - **Konfiguration per `.env`-Datei** (mit `06_config_bearbeiten.bat` bequem im Editor änderbar)
+- **3D-Avatar, kein Profilbild**: es wird das echte OBJ/MTL/Textur-Modell geladen (Roblox-Endpunkt `avatar-3d`)
+- **Öffentliche HTTPS-Adresse** für veröffentlichte Spiele (`08_oeffentliche_adresse.bat`)
 
 ## 🚀 Schnellstart (Windows)
 
@@ -37,7 +39,9 @@ Das System besteht aus zwei Teilen:
 | 2 | `01_setup.bat` doppelklicken (installiert alles, einmalig, ~10 Minuten) |
 | 3 | `02_start.bat` doppelklicken → Server läuft |
 | 4 | In Roblox Studio die zwei Skripte aus dem Ordner `roblox/` einfügen (Anleitung: [`ANLEITUNG.md`](ANLEITUNG.md)) |
-| 5 | Optional: `04_autostart_installieren.bat` → startet künftig automatisch bei PC-Start |
+| 5 | Open-Cloud-API-Key mit Recht **thumbnails: Read** in die `.env` (sonst HTTP 403 beim 3D-Download) |
+| 6 | Optional: `04_autostart_installieren.bat` → startet künftig automatisch bei PC-Start |
+| 7 | Für ein **veröffentlichtes** Spiel: `08_oeffentliche_adresse.bat` und die `https://`-URL ins Lua-Skript |
 
 📖 **Die komplette, sehr ausführliche Anleitung für Anfänger steht in [`ANLEITUNG.md`](ANLEITUNG.md)!**
 🎮 Die Roblox-Studio-Einrichtung zusätzlich Schritt für Schritt: [`roblox/ANLEITUNG_ROBLOX.md`](roblox/ANLEITUNG_ROBLOX.md)
@@ -53,6 +57,8 @@ BlenderRenderServer/
 ├── 05_autostart_entfernen.bat    ← Autostart entfernen
 ├── 06_config_bearbeiten.bat      ← Einstellungen (.env) im Editor öffnen
 ├── 07_im_browser_testen.bat      ← Statusseite im Browser öffnen
+├── 08_oeffentliche_adresse.bat   ← HTTPS-URL für veröffentlichte Spiele
+├── 09_verbindung_pruefen.bat     ← Roblox / GitHub / API-Key testen
 ├── .env                          ← Deine Einstellungen (wird beim Setup erstellt)
 ├── run.py                        ← Starter/Watchdog (von 02_start.bat benutzt)
 ├── server/                       ← Der eigentliche Server-Code (Python)
@@ -60,7 +66,9 @@ BlenderRenderServer/
 │   ├── avatar.py                 ← Roblox-Avatar-Download (OBJ/MTL/Texturen)
 │   ├── blender_render.py         ← Rendering in Blender (Glas-Material, Cycles)
 │   ├── blender_runner.py         ← Findet & startet Blender
-│   └── updater.py                ← Auto-Update von GitHub
+│   ├── updater.py                ← Auto-Update von GitHub
+│   ├── tunnel.py                 ← Öffentliche HTTPS-Adresse (Cloudflare)
+│   └── diagnostics.py            ← Verbindungscheck (09_verbindung_pruefen.bat)
 ├── roblox/                       ← Die zwei Lua-Skripte für Roblox Studio
 ├── tools/blender/                ← Blender-Installation (kommt vom Setup)
 ├── data/jobs/                    ← Gerenderte Bilder + heruntergeladene Avatare
@@ -71,7 +79,8 @@ BlenderRenderServer/
 
 | Methode | Pfad | Beschreibung |
 |---|---|---|
-| GET | `/health` | Ist der Server erreichbar? |
+| GET | `/health` | Ist der Server erreichbar? (inkl. `api_key_set`, `public_url`) |
+| GET | `/diagnostics` | Roblox-3D-API, GitHub, Blender, API-Key prüfen |
 | POST | `/jobs` | Auftrag anlegen: `{"username": "Name"}` |
 | GET | `/jobs/current` | Status des aktuellen Auftrags (state, progress, ...) |
 | GET | `/jobs/{id}/image/info` | Bildgröße (wenn fertig) |
