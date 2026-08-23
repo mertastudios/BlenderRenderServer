@@ -1,18 +1,16 @@
 """Laedt den Roblox-Avatar eines Benutzernamens als 3D-Modell herunter.
 
-Ablauf (alles ohne API-Key moeglich, da oeffentliche Roblox-Endpunkte):
-  1. Benutzername -> UserId        (users.roblox.com)
-  2. UserId -> 3D-Thumbnail-Manifest (thumbnails.roblox.com, Format "avatar-3d")
-     Das Manifest ist JSON und enthaelt: OBJ-Hash, MTL-Hash, Textur-Hashes,
-     Kameradaten und die Bounding-Box.
-  3. OBJ / MTL / Texturen einzeln vom Roblox-CDN (tX.rbxcdn.com) laden
+Ablauf:
+  1. Benutzername -> UserId        (users.roblox.com, oeffentlich)
+  2. UserId -> 3D-Avatar-Manifest  (thumbnails.roblox.com /v1/users/avatar-3d)
+     WICHTIG: Das ist KEIN Profilbild. Die "avatar-3d"-API liefert ein JSON
+     mit OBJ-Hash, MTL-Hash, Textur-Hashes, Kamera und Bounding-Box.
+     Seit 23. Maerz 2026 verlangt Roblox hierfuer einen Open-Cloud-API-Key
+     mit Recht "thumbnails: Read" (sonst HTTP 401/403).
+  3. OBJ / MTL / Texturen einzeln vom Roblox-CDN laden
      und in <job>/model/ speichern.
   4. Dem OBJ eine "mtllib avatar.mtl" Zeile voranstellen, damit Blender
      Material + Texturen automatisch verknuepft.
-
-Falls in der .env ein ROBLOX_API_KEY (Open Cloud, "asset-legacy-delivery")
-hinterlegt ist, wird dieser zusaetzlich als Ausweichpfad fuer einzelne
-Asset-Downloads benutzt.
 """
 from __future__ import annotations
 
@@ -30,17 +28,52 @@ class AvatarError(RuntimeError):
 
 
 HTTP_TIMEOUT = 30
-UA = {"User-Agent": "BlenderRenderServer/1.0 (+github.com/mertastudios/BlenderRenderServer)"}
+UA = {
+    "User-Agent": "BlenderRenderServer/1.1 (+https://github.com/mertastudios/BlenderRenderServer)",
+    "Accept": "application/json",
+}
+CDN_HOSTS = [f"t{i}.rbxcdn.com" for i in range(8)] + ["tr.rbxcdn.com", "c0.rbxcdn.com"]
 
 
 def _session() -> requests.Session:
     s = requests.Session()
     s.headers.update(UA)
+    if config.ROBLOX_API_KEY:
+        s.headers["x-api-key"] = config.ROBLOX_API_KEY
     return s
 
 
+def auth_error_message(status_code: int, key_was_sent: bool) -> str:
+    """Verstaendliche Meldung, wenn Roblox den 3D-Avatar-Download ablehnt."""
+    if not key_was_sent:
+        return (
+            f"3D-Avatar-Download von Roblox abgelehnt (HTTP {status_code}). "
+            "Das ist KEIN Profilbild, sondern das echte 3D-Modell "
+            "(OBJ + Materialien + Texturen) fuer Blender. "
+            "Seit Maerz 2026 verlangt Roblox dafuer einen Open-Cloud-API-Key "
+            'mit dem Recht "thumbnails: Read". '
+            "So geht's: 1) https://create.roblox.com/dashboard/credentials  "
+            '2) Create API Key -> Access Permissions: System "thumbnails", '
+            'Operation "Read"  '
+            "3) Key in der .env bei ROBLOX_API_KEY=... eintragen "
+            "(ohne Anfuehrungszeichen)  "
+            "4) Server neu starten (03_stop.bat, dann 02_start.bat). "
+            "Ausfuehrlich: ANLEITUNG.md Abschnitt 9."
+        )
+    return (
+        f"3D-Avatar-Download von Roblox abgelehnt (HTTP {status_code}), "
+        "obwohl ein API-Key gesendet wurde. Pruefe: "
+        '1) Der Key hat das Recht "thumbnails: Read" '
+        "(nicht nur asset-legacy-delivery). "
+        "2) Der Key ist aktiv und nicht abgelaufen. "
+        "3) Falls der Key eine IP-Sperre hat, muss die IP deines PCs "
+        "erlaubt sein (oder die IP-Beschraenkung leer lassen). "
+        "4) Key in der .env ohne Anfuehrungszeichen, Server danach neu starten."
+    )
+
+
 # ------------------------------------------------------------------------------
-#  Open Cloud (optionaler API-Key)
+#  Open Cloud (optionaler Zusatzweg fuer einzelne Assets)
 # ------------------------------------------------------------------------------
 
 def legacy_delivery_download(session: requests.Session, asset_id: str | int) -> bytes:
@@ -66,7 +99,6 @@ def legacy_delivery_download(session: requests.Session, asset_id: str | int) -> 
                     if r2.ok:
                         return r2.content
             if resp.ok:
-                # Manche Antworten liefern JSON mit einer Download-URL
                 try:
                     body = resp.json()
                     for key in ("downloadUrl", "location", "url"):
@@ -121,45 +153,118 @@ def resolve_user_id(session: requests.Session, username: str) -> int:
 #  Schritt 2: 3D-Manifest holen
 # ------------------------------------------------------------------------------
 
+def _host_from_url(url: str) -> str:
+    return re.sub(r"^https?://", "", url or "").split("/")[0]
+
+
+def _load_manifest_from_url(session: requests.Session, image_url: str) -> tuple[dict, str]:
+    manifest_resp = session.get(image_url, timeout=HTTP_TIMEOUT)
+    if manifest_resp.status_code in (401, 403):
+        raise AvatarError(auth_error_message(manifest_resp.status_code, bool(config.ROBLOX_API_KEY)))
+    if not manifest_resp.ok:
+        raise AvatarError(
+            f"3D-Manifest-Download fehlgeschlagen (HTTP {manifest_resp.status_code})."
+        )
+    try:
+        manifest = manifest_resp.json()
+    except ValueError as exc:
+        raise AvatarError("3D-Manifest war kein gueltiges JSON.") from exc
+    if not isinstance(manifest, dict) or not manifest.get("obj"):
+        raise AvatarError(
+            "3D-Manifest enthaelt kein OBJ (Avatar evtl. nicht als 3D verfuegbar)."
+        )
+    return manifest, _host_from_url(image_url)
+
+
+def _looks_like_manifest(data: object) -> bool:
+    return isinstance(data, dict) and bool(data.get("obj"))
+
+
 def fetch_3d_manifest(session: requests.Session, user_id: int) -> tuple[dict, str]:
-    """Gibt (Manifest-JSON, CDN-Host) zurueck. Pollt bis der Thumbnail fertig ist."""
-    url = f"https://thumbnails.roblox.com/v1/users/avatar-3d?userIds={user_id}"
+    """Gibt (Manifest-JSON, CDN-Host) zurueck. Pollt bis der 3D-Avatar fertig ist.
+
+    Nutzt die offizielle avatar-3d-API (liefert OBJ/MTL/Texturen, kein Profilbild).
+    """
+    urls = (
+        f"https://thumbnails.roblox.com/v1/users/avatar-3d?userId={user_id}",
+        f"https://thumbnails.roblox.com/v1/users/avatar-3d?userIds={user_id}",
+        f"https://www.roblox.com/avatar-thumbnail-3d/json?userId={user_id}",
+    )
     last_state = ""
+    last_http_error = ""
     for attempt in range(40):
-        try:
-            resp = session.get(url, timeout=HTTP_TIMEOUT)
-        except requests.RequestException as exc:
-            raise AvatarError(f"Keine Verbindung zu thumbnails.roblox.com: {exc}") from exc
-        if not resp.ok:
-            raise AvatarError(f"Thumbnail-API antwortete mit HTTP {resp.status_code}.")
-        entries = (resp.json() or {}).get("data") or []
-        if not entries:
-            raise AvatarError("Thumbnail-API lieferte keine Daten fuer diesen Benutzer.")
-        entry = entries[0]
-        state = entry.get("state", "")
-        if state == "Completed" and entry.get("imageUrl"):
-            image_url = entry["imageUrl"]
-            host = re.sub(r"^https?://", "", image_url).split("/")[0]
-            # Die imageUrl verweist auf das JSON-Manifest
-            manifest_resp = session.get(image_url, timeout=HTTP_TIMEOUT)
-            if not manifest_resp.ok:
-                raise AvatarError(f"Manifest-Download fehlgeschlagen (HTTP {manifest_resp.status_code}).")
+        saw_pending = False
+        for url in urls:
             try:
-                manifest = manifest_resp.json()
-            except ValueError as exc:
-                raise AvatarError("3D-Manifest war kein gueltiges JSON.") from exc
-            if not manifest.get("obj"):
-                raise AvatarError("3D-Manifest enthaelt kein OBJ (Avatar evtl. nicht als 3D verfuegbar).")
-            return manifest, host
-        if state == "Blocked":
-            raise AvatarError(
-                "Roblox hat den 3D-Thumbnail fuer diesen Avatar blockiert. "
-                "Versuche einen anderen Benutzernamen."
+                resp = session.get(url, timeout=HTTP_TIMEOUT)
+            except requests.RequestException as exc:
+                last_http_error = str(exc)
+                continue
+            if resp.status_code in (401, 403):
+                raise AvatarError(auth_error_message(resp.status_code, bool(config.ROBLOX_API_KEY)))
+            if resp.status_code == 429:
+                last_http_error = "HTTP 429 (zu viele Anfragen)"
+                time.sleep(2.0 + attempt * 0.2)
+                continue
+            if not resp.ok:
+                last_http_error = f"HTTP {resp.status_code} von {url.split('?')[0]}"
+                continue
+            try:
+                payload = resp.json()
+            except ValueError:
+                last_http_error = "Antwort war kein JSON"
+                continue
+
+            if _looks_like_manifest(payload):
+                host = ""
+                for key in ("obj", "mtl"):
+                    value = str(payload.get(key) or "")
+                    if value.startswith("http"):
+                        host = _host_from_url(value)
+                        break
+                return payload, host
+
+            entries = []
+            if isinstance(payload, dict):
+                if isinstance(payload.get("data"), list):
+                    entries = payload["data"]
+                elif payload.get("imageUrl") or payload.get("url") or payload.get("Url"):
+                    entries = [payload]
+            if not entries:
+                last_http_error = "3D-Avatar-API lieferte keine Daten fuer diesen Benutzer."
+                continue
+            entry = entries[0] if isinstance(entries[0], dict) else {}
+            state = str(entry.get("state") or "")
+            image_url = (
+                entry.get("imageUrl")
+                or entry.get("url")
+                or entry.get("Url")
+                or ""
             )
-        if state != last_state:
-            last_state = state
+            if state == "Completed" and image_url:
+                return _load_manifest_from_url(session, image_url)
+            if not state and image_url:
+                return _load_manifest_from_url(session, image_url)
+            if state == "Blocked":
+                raise AvatarError(
+                    "Roblox hat den 3D-Avatar fuer diesen Benutzer blockiert. "
+                    "Versuche einen anderen Benutzernamen."
+                )
+            if state and state not in ("Completed", "Blocked"):
+                saw_pending = True
+            if state and state != last_state:
+                last_state = state
+                print(f"[Avatar] 3D-Modell wird vorbereitet (Status: {state}) ...")
+        if last_http_error and not saw_pending and attempt >= 1:
+            raise AvatarError(
+                f"3D-Avatar konnte nicht geladen werden ({last_http_error})."
+            )
         time.sleep(1.0 + attempt * 0.1)
-    raise AvatarError("3D-Thumbnail wurde nicht rechtzeitig fertig (Timeout nach ~60 s).")
+    if last_http_error:
+        raise AvatarError(
+            f"3D-Avatar konnte nicht geladen werden ({last_http_error})."
+        )
+    raise AvatarError("3D-Avatar wurde nicht rechtzeitig fertig (Timeout nach ~60 s).")
 
 
 # ------------------------------------------------------------------------------
@@ -168,12 +273,30 @@ def fetch_3d_manifest(session: requests.Session, user_id: int) -> tuple[dict, st
 
 def _download_cdn(session: requests.Session, host: str, name: str) -> bytes:
     """Laedt eine Datei (per Hash-Namen) vom Roblox-CDN."""
-    name = name.strip().strip("/")
-    candidates = [f"https://{host}/{name}"]
-    if "." not in name.rsplit("/", 1)[-1]:
-        candidates.append(f"https://{host}/{name}.png")
+    name = (name or "").strip().strip("/")
+    if name.startswith("http://") or name.startswith("https://"):
+        try:
+            resp = session.get(name, timeout=HTTP_TIMEOUT)
+        except requests.RequestException as exc:
+            raise AvatarError(f"CDN-Download fehlgeschlagen ({name[:60]} ... {exc}).") from exc
+        if resp.ok and resp.content:
+            return resp.content
+        raise AvatarError(f"CDN-Download fehlgeschlagen ({name[:60]} ... HTTP {resp.status_code}).")
+
+    hosts: list[str] = []
+    if host:
+        hosts.append(host)
+    for candidate in CDN_HOSTS:
+        if candidate not in hosts:
+            hosts.append(candidate)
+
     last = ""
-    for url in candidates:
+    urls: list[str] = []
+    for h in hosts:
+        urls.append(f"https://{h}/{name}")
+        if "." not in name.rsplit("/", 1)[-1]:
+            urls.append(f"https://{h}/{name}.png")
+    for url in urls:
         try:
             resp = session.get(url, timeout=HTTP_TIMEOUT)
         except requests.RequestException as exc:
@@ -182,7 +305,7 @@ def _download_cdn(session: requests.Session, host: str, name: str) -> bytes:
         if resp.ok and resp.content:
             return resp.content
         last = f"HTTP {resp.status_code}"
-    raise AvatarError(f"CDN-Download fehlgeschlagen ({name[:40]}... {last}).")
+    raise AvatarError(f"CDN-Download fehlgeschlagen ({name[:40]} ... {last}).")
 
 
 def _mtl_texture_refs(mtl_text: str) -> list[str]:
@@ -195,7 +318,7 @@ def _mtl_texture_refs(mtl_text: str) -> list[str]:
         keyword = parts[0].lower()
         if keyword.startswith("map_") or keyword in ("bump", "norm", "disp", "refl"):
             for token in parts[1:]:
-                if token.startswith("-"):  # Optionen wie -s 1 1 1 ueberspringen
+                if token.startswith("-"):
                     continue
                 if re.fullmatch(r"\d+(\.\d+)?", token):
                     continue
@@ -220,15 +343,19 @@ def download_avatar_model(username: str, dest_dir: Path) -> dict:
 
     user_id = resolve_user_id(session, username)
     print(f"[Avatar] Benutzer '{username}' hat die UserId {user_id}")
+    if not config.ROBLOX_API_KEY:
+        print(
+            "[Avatar] Hinweis: kein ROBLOX_API_KEY gesetzt - "
+            "der 3D-Download schlaegt seit Maerz 2026 meist mit HTTP 403 fehl."
+        )
 
     manifest, host = fetch_3d_manifest(session, user_id)
-    print(f"[Avatar] 3D-Manifest erhalten (CDN: {host})")
+    print(f"[Avatar] 3D-Modell-Manifest erhalten (CDN: {host or 'wird automatisch gesucht'})")
 
     textures = list(manifest.get("textures") or [])
 
-    # OBJ laden (ohne mtllib-Zeile -> wir ergaenzen sie)
-    obj_data = _download_cdn(session, host, manifest["obj"])
-    # MTL laden
+    obj_ref = manifest["obj"]
+    obj_data = _download_cdn(session, host, obj_ref)
     mtl_name = manifest.get("mtl") or ""
     mtl_data = b""
     if mtl_name:
@@ -237,17 +364,16 @@ def download_avatar_model(username: str, dest_dir: Path) -> dict:
         except AvatarError as exc:
             print(f"[Avatar] Warnung: MTL nicht ladbar ({exc})")
 
-    # In MTL referenzierte Texturen mit den Texturen aus dem Manifest vereinen
     refs = _mtl_texture_refs(mtl_data.decode("utf-8", "replace")) if mtl_data else []
     for tex in textures:
         base = str(tex).strip("/").rsplit("/", 1)[-1]
         if base and base.lower() not in {r.lower() for r in refs}:
             refs.append(base)
 
-    # Texturen herunterladen und exakt unter dem Namen speichern, den die MTL nennt
     texture_files: list[str] = []
     for ref in refs:
-        base = ref if "." in ref else f"{ref}.png"
+        base = ref if "." in Path(ref).name else f"{ref}.png"
+        base = Path(base).name
         try:
             data = _download_cdn(session, host, ref)
         except AvatarError:
@@ -260,7 +386,6 @@ def download_avatar_model(username: str, dest_dir: Path) -> dict:
         texture_files.append(base)
         print(f"[Avatar] Textur geladen: {base} ({len(data) // 1024} KB)")
 
-    # OBJ speichern, inkl. mtllib-Verweis auf avatar.mtl
     obj_text = obj_data.decode("utf-8", "replace")
     if "mtllib" not in obj_text:
         obj_text = "mtllib avatar.mtl\n" + obj_text

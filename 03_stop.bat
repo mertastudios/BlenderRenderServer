@@ -17,8 +17,12 @@ if defined PID (
 REM Ausweichweg: Konsolenfenster mit Server-Titel schliessen
 taskkill /FI "WINDOWTITLE eq Blender Render Server" /IM cmd.exe /F >nul 2>&1
 taskkill /FI "WINDOWTITLE eq Blender Render Server" /IM python.exe /F >nul 2>&1
+taskkill /FI "WINDOWTITLE eq Blender Render Server - Oeffentliche Adresse" /F >nul 2>&1
+taskkill /IM cloudflared.exe /F >nul 2>&1
 
 if exist "logs\pid.txt" del "logs\pid.txt" >nul 2>&1
+if exist "data\public_url.txt" del "data\public_url.txt" >nul 2>&1
+if exist "data\tunnel.pid" del "data\tunnel.pid" >nul 2>&1
 
 echo Fertig! Der Server ist jetzt AUS.
 echo (Zum Wiederanschalten: 02_start.bat doppelklicken)

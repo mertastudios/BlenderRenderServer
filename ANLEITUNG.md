@@ -22,7 +22,7 @@ manuell ausschalten.
 - [ ] Einen Roblox-Account. Für EditableImages in echten Online-Spielen muss der
       Account **13+ und ID-verifiziert** sein (https://www.roblox.com/my/account )
       – **zum Testen in Studio reicht das normalerweise auch ohne.**
-- [ ] Optional (nicht nötig!): ein Roblox Open-Cloud-API-Key (siehe Abschnitt 9)
+- [ ] Ein Roblox Open-Cloud-API-Key mit Recht **thumbnails: Read** (Abschnitt 9) – seit März 2026 nötig für den 3D-Avatar
 
 ⚠️ **Kosten:** Alles hier Genutzte ist kostenlos (Python, Blender, Roblox-APIs).
 
@@ -80,8 +80,9 @@ manuell ausschalten.
 | `RENDER_MATERIAL` | `glass` = ganzer Avatar in Glas. `original` = Avatar mit echten Texturen. | `glass` |
 | `RENDER_TRANSPARENT_BG` | `false` = schöner Himmelshintergrund (sieht bei Glas am besten aus). `true` = durchsichtiges PNG. | `false` |
 | `RENDER_DEVICE` | `CPU` = immer sicher. `GPU` = schneller, wenn eine gute Grafikkarte eingebaut ist. | `CPU` |
-| `ROBLOX_API_KEY` | Optionaler Roblox-API-Key (siehe Abschnitt 9). **Darf leer bleiben!** | leer |
-| `AUTO_UPDATE` | `true` = automatische Updates von GitHub (empfohlen). | `true` |
+| `ROBLOX_API_KEY` | Open-Cloud-API-Key mit Recht **thumbnails: Read**. Seit März 2026 **nötig** für den 3D-Avatar-Download (sonst HTTP 403). Siehe Abschnitt 9. | leer |
+| `AUTO_UPDATE` | `true` = automatische Updates von GitHub. Wenn „GitHub nicht erreichbar“ kommt: Rendern geht trotzdem, siehe Abschnitt 12. | `true` |
+| `BRS_ACCESS_TOKEN` | Gemeinsames Geheimnis für öffentliche URLs (dann denselben Wert im Lua-Skript bei `RENDER_ACCESS_TOKEN`). | leer |
 | `BRS_TEST_MODE` | `true` = rendert eine eingebaute Testfigur **ohne** Verbindung zu Roblox (super für den ersten Test!). Danach wieder auf `false` stellen. | `false` |
 
 3. Speichern (Strg+S) und Editor schließen.
@@ -183,30 +184,93 @@ Der Server läuft auf dem PC, auf dem du ihn installiert hast.
   3. Windows-Firewall muss den Port erlauben (beim ersten Start „Zulassen“
      klicken; sonst Systemsteuerung → Windows Defender Firewall → „App durch
      Firewall lassen“ → Python aktivieren).
-- **Kostenlos auf einem Online-PC hosten:** Möglich, aber nicht nötig – für
-  dein Szenario (Studio-Tests zuhause) ist der eigene PC die einfachste,
-  sorgenfreieste Lösung.
+- **Veroeffentlichtes Spiel im echten Roblox-Client:** `localhost` geht
+  **nicht**. Roblox startet das Spiel auf Cloud-Servern – die kennen deinen
+  PC nicht. Siehe Abschnitt 8b.
 
 ⚠️ Sicherheit: Gib den Port **nicht** im Router nach außen frei (kein
-„Port-Forwarding“). Der Server ist fürs Heimnetz gedacht.
+„Port-Forwarding“). Für die Öffentlichkeit nutzen wir einen Tunnel
+(Abschnitt 8b), der HTTPS mitbringt.
 
 ---
 
-## 9) (Optional) Roblox Open-Cloud-API-Key hinterlegen
+## 8b) Spiel veröffentlichen: die richtige URL finden
 
-Der Avatar-Download funktioniert **auch ohne** API-Key über die öffentlichen
-Roblox-Endpunkte. Der Key ist ein Zusatzweg (u.a. „asset-legacy-delivery“),
-falls einzelne Roblox-Assets sonst nicht ladbar sind.
+In **Roblox Studio** auf demselben PC reicht:
 
-So erstellst du ihn (optional):
-1. Gehe zu https://create.roblox.com/dashboard/credentials (Creator-Dashboard →
-   „Open Cloud“ → „API Keys“ bzw. „Credentials“).
-2. **Add API Key** (bzw. „Create“), Name z.B. `render-server`.
-3. Bei Berechtigungen **Assets → Asset Legacy Delivery → Read** hinzufügen.
-4. Schlüssel kopieren.
-5. Bei uns eintragen: `06_config_bearbeiten.bat` → bei `ROBLOX_API_KEY=` den
-   Schlüssel einfügen (alles in einer Zeile, keine Anführungszeichen).
-6. Server mit `03_stop.bat` + `02_start.bat` neu starten.
+```lua
+local RENDER_SERVER_URL = "http://localhost:8000"
+```
+
+Sobald Spieler das Spiel **im Roblox-Client** öffnen (Play-Button auf der
+Website / App), läuft der Game-Server **bei Roblox**, nicht auf deinem PC.
+`localhost` zeigt dann auf Roblox selbst – dein Render-Server wird nie erreicht.
+
+Zusätzlich verlangt Roblox im Live-Spiel **HTTPS** (nicht `http://`).
+
+**So bekommst du die richtige Adresse (kostenlos):**
+
+1. Render-Server wie immer starten: `02_start.bat` (Fenster offen lassen).
+2. Zusätzlich `08_oeffentliche_adresse.bat` doppelklicken.
+3. Nach ein paar Sekunden erscheint eine Adresse wie
+   `https://irgendwas-zufaellig.trycloudflare.com`.
+4. Diese Adresse **komplett** im Lua-Skript eintragen:
+   ```lua
+   local RENDER_SERVER_URL = "https://irgendwas-zufaellig.trycloudflare.com"
+   ```
+5. Wenn du in der `.env` ein `BRS_ACCESS_TOKEN` gesetzt hast, denselben Wert
+   bei `RENDER_ACCESS_TOKEN` im Skript eintragen.
+6. Spiel in Studio speichern / veröffentlichen. **Beide schwarzen Fenster
+   offen lassen**, solange jemand spielt. Der PC muss an sein.
+
+Die Quick-Tunnel-Adresse **ändert sich nach jedem Neustart** von
+`08_oeffentliche_adresse.bat`. Dann die neue URL wieder ins Skript kopieren.
+
+**Woran erkenne ich, welche URL ich brauche?**
+
+| Wo testest du? | Welche URL? |
+|---|---|
+| Studio, Play auf **diesem** PC | `http://localhost:8000` |
+| Studio auf einem **anderen** Gerät im WLAN | `http://192.168.x.x:8000` (ipconfig) |
+| Echtes Spiel / Roblox-App / Freunde | `https://….trycloudflare.com` aus `08_oeffentliche_adresse.bat` |
+
+Tipp: `09_verbindung_pruefen.bat` zeigt an, ob gerade eine öffentliche URL
+aktiv ist. Dieselbe Info steht auch auf http://localhost:8000.
+
+---
+
+## 9) Roblox Open-Cloud-API-Key anlegen (seit März 2026 nötig!)
+
+Der Server lädt **kein Profilbild**. Er holt das echte **3D-Modell** deines
+Avatars (OBJ + Materialien + Texturen) über Roblox’ `avatar-3d`-API
+(`thumbnails.roblox.com/v1/users/avatar-3d`). Der Name „Thumbnail“ ist
+irreführend: die Antwort ist ein JSON-Manifest mit 3D-Dateien, kein PNG.
+
+Seit dem **23. März 2026** blockiert Roblox diesen 3D-Download ohne Login.
+Ohne Key siehst du genau den Fehler aus deinem Test:
+
+`3D-Avatar-Download von Roblox abgelehnt (HTTP 403)` bzw. `HTTP 401`.
+
+**So legst du den Key an (einmalig, kostenlos):**
+
+1. Gehe zu https://create.roblox.com/dashboard/credentials
+   (Creator-Dashboard → **Open Cloud** → **Credentials** / API Keys).
+2. **Create API Key**, Name z.B. `blender-render`.
+3. Unter **Access Permissions**:
+   - System / API-System: **`thumbnails`**
+   - Operation: **`Read`**
+   - Das ist der wichtige Teil. Optional zusätzlich
+     **Assets → Asset Legacy Delivery → Read** (nur Ausweichweg).
+4. Bei **IP Access** am einfachsten **keine Einschränkung** (oder deine
+   aktuelle öffentliche IP erlauben). Eine falsche IP-Sperre erzeugt wieder 403.
+5. Key erzeugen und **sofort kopieren** (wird nur einmal angezeigt).
+6. `06_config_bearbeiten.bat` → Zeile
+   `ROBLOX_API_KEY=` und den Key **direkt dahinter**, eine Zeile, **keine**
+   Anführungszeichen, keine Leerzeichen.
+7. Speichern. Server neu starten: `03_stop.bat`, dann `02_start.bat`.
+8. Kontrolle: Im Server-Fenster muss stehen `API-Key: gesetzt`.
+   Zusätzlich `09_verbindung_pruefen.bat` ausführen – die Zeile
+   „Roblox 3D-Avatar-API“ sollte OK sein.
 
 ---
 
@@ -243,6 +307,11 @@ Du kannst die Bilder jederzeit direkt öffnen oder weiterverwenden.
 | Roblox-Console zeigt `🔴 SERVER DOWN` | Server läuft nicht → `02_start.bat` starten. Falls er läuft: stimmt die Adresse/der Port im Lua-Skript mit `BRS_PORT` aus der `.env` überein? Studio auf anderem Gerät? Dann IP statt `localhost` benutzen (Abschnitt 8). |
 | Roblox-Fehler `Http requests are not enabled` | In Studio: Home → Game Settings → Security → **Allow HTTP Requests = ON**, dann Play neu starten. |
 | `01_setup.bat` bleibt beim Blender-Download hängen | Internet prüfen und Setup einfach nochmal starten (es macht da weiter, wo es aufgehört hat – Blender wird erst entpackt, wenn es komplett geladen ist). Alternativ Blender manuell von blender.org laden (ZIP-Version 4.5) und in den Ordner `tools\blender` entpacken (so, dass `tools\blender\blender.exe` existiert), dann Setup erneut starten. |
+| `HTTP 403` / `HTTP 401` beim Avatar / „3D-Avatar-Download abgelehnt“ | Kein oder falscher API-Key. Abschnitt 9 befolgen (`thumbnails: Read`, Server neu starten). Das ist der 3D-Modell-Download, kein Profilbild. |
+| `GitHub nicht erreichbar` | Nur das Auto-Update ist betroffen, **Rendern geht trotzdem**. Firewall/Antivirus für `github.com` + `python.exe` erlauben, oder `AUTO_UPDATE=false` in der `.env`. Details: `09_verbindung_pruefen.bat`. |
+| Im echten Spiel keine Verbindung, in Studio schon | `localhost` geht nur in Studio. Abschnitt 8b: `08_oeffentliche_adresse.bat` und die `https://`-URL ins Lua-Skript. |
+| `Expected identifier … got '<'` | Du hast eine `.rbxmx`-XML-Datei als Skript eingefügt. Nur den **Text** aus den `.lua`-Dateien kopieren. |
+| `user_exporter.rbxmx` / `Animation Spoofer` in der Konsole | Andere Studio-Plugins, nicht dieser Render-Server. Kann ignoriert werden. |
 | `Benutzername 'x' wurde nicht gefunden` | Schreibweise des Roblox-Namens im Server-Skript prüfen. |
 | Render dauert sehr lange | `RENDER_SAMPLES` in der `.env` auf z.B. `48` setzen und neu starten. |
 | Bild sieht „geisterhaft“ aus | Das ist Glas! 😄 Für kräftigere Optik: `RENDER_TRANSPARENT_BG=false` (Himmelshintergrund) und ggf. `RENDER_MATERIAL=original` testen. |
@@ -273,6 +342,16 @@ der Auftrag bricht ab. Nach dem Neustart startet der Server automatisch neu
 **Warum nur ein Auftrag gleichzeitig?** Damit die Konsole und der Ablauf immer
 klar bleiben und dein PC nicht überlastet wird. Weitere Aufträge landen in der
 Warteschlange (maximal einer wartet, der Neueste gewinnt).
+
+**Ist „Thumbnail-API“ nicht nur das Profilbild?** Nein. Roblox nennt den
+Endpunkt `avatar-3d` intern „Thumbnail“, aber die Antwort ist ein JSON mit
+**OBJ + MTL + Texturen** – genau das 3D-Modell, das Blender braucht. Das
+normale Profilbild wäre `avatar-headshot` (ein PNG). Das verwenden wir nicht.
+
+**Warum sagt Studio etwas von `user_exporter.rbxmx` / Animation Spoofer?**
+Das kommt von anderen Plugins, nicht von diesem Projekt. Unsere Skripte
+heißen `RenderServerService` / `RenderClient` und schreiben immer
+`[BlenderRender]` davor.
 
 ---
 

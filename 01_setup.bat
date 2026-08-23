@@ -121,10 +121,13 @@ echo.
 echo  ============================================================
 echo    SETUP FERTIG!  Was jetzt?
 echo  ============================================================
-echo    1. Einstellungen pruefen:  06_config_bearbeiten.bat
+echo    1. API-Key eintragen:      06_config_bearbeiten.bat  (ROBLOX_API_KEY)
+echo       (seit Maerz 2026 noetig: thumbnails - Read, siehe ANLEITUNG.md §9)
 echo    2. Server starten:         02_start.bat
-echo    3. (Empfohlen) Autostart:  04_autostart_installieren.bat
-echo    4. Roblox-Teil einrichten: ANLEITUNG.md, Abschnitt Roblox
+echo    3. Verbindung testen:      09_verbindung_pruefen.bat
+echo    4. (Empfohlen) Autostart:  04_autostart_installieren.bat
+echo    5. Roblox-Teil einrichten: ANLEITUNG.md / roblox/ANLEITUNG_ROBLOX.md
+echo    6. Spiel veroeffentlichen: 08_oeffentliche_adresse.bat
 echo  ============================================================
 echo.
 pause
