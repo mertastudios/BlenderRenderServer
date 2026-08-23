@@ -138,8 +138,6 @@ local function ensureImage(width, height)
 	end)
 	if ok and result then
 		editableImage = result
-		-- WICHTIG: EditableImage ist KEINE Instance, .Name gibt es nicht!
-		-- Anzeige erfolgt ueber Content.fromObject (siehe naechste Zeile).
 		imageLabel.ImageContent = Content.fromObject(editableImage)
 		imageLabel.BackgroundColor3 = Color3.fromRGB(20, 22, 27)
 		return editableImage
