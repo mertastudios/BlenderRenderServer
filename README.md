@@ -1,94 +1,72 @@
 # 🧊 BlenderRenderServer
 
-**Roblox-Avatare automatisch als 3D-Modell herunterladen und mit Blender Cycles in Glas rendern – komplett auf deinem eigenen PC, kostenlos.**
-
-Das System besteht aus zwei Teilen:
+**Roblox-Avatare & Szenen als 3D-Modell herunterladen und mit Blender Cycles rendern – gesteuert über `manage_render` in Roblox Studio.**
 
 ```
-┌─────────────────────┐   HTTP (localhost)   ┌──────────────────────────────┐
-│  Roblox Studio      │ ◄──────────────────► │  Dein PC (dieses Programm)  │
-│  ─────────────      │                      │  ──────────────────────────  │
-│  Server-Skript      │  1. "Rendere Avatar  │  1. Avatar von Roblox laden  │
-│  (ServerScript-     │      von MaxMuste    │     (OBJ + Material +        │
-│   Service)          │      Erman!"         │      Texturen)               │
-│  Client-Skript      │  2. Status abfragen  │  2. Blender Cycles: Glas-    │
-│  (LocalScript)      │     ("rendert...",   │     Render in 1024x1024      │
-│                     │     "Warteschlange") │  3. fertiges Bild als Pixel- │
-│  GUI zeigt das      │  3. Bild stückweise  │     Daten bereitstellen      │
-│  fertige Bild       │     abholen          │  4. Auto-Update von GitHub   │
-└─────────────────────┘                      └──────────────────────────────┘
+┌─────────────────────────┐   HTTP (localhost)   ┌──────────────────────────────┐
+│  Roblox Studio          │ ◄──────────────────► │  Dein PC (dieses Programm)  │
+│  ─────────────          │                      │  ──────────────────────────  │
+│  manage_render          │  1. "Create", Folder │  1. Szene & Avatare laden    │
+│  (BindableFunction)     │                      │     (3D OBJ + MTL + Texturen)│
+│  - "Create", Folder     │  2. "Status", JobID  │  2. Custom Models & Posing   │
+│  - "Status", JobID      │     ("active", 14s)  │  3. Cycles High-End Render   │
+│  - "Download", JobID    │  3. "Download", JobID│  4. RGBA Pixelbuffer senden  │
+│                         │     (Pixelbuffer)    │  5. 7 Tage Speicher & Clean  │
+└─────────────────────────┘                      └──────────────────────────────┘
 ```
 
-## ✨ Features
+## ✨ Highlights & Features
 
-- **Ein-Klick-Setup**: `01_setup.bat` installiert Python + Blender 4.5 automatisch (Windows 10/11)
-- **Komplett kostenlos** – alles läuft lokal auf deinem PC
-- **Auto-Start**: startet nach jedem PC-Neustart automatisch (auf Wunsch)
-- **Live Auto-Update & Selbst-Neustart**: Sobald auf GitHub neue Änderungen im `main`-Branch ankommen, aktualisiert sich der Server im laufenden Betrieb selbst, startet automatisch neu und läuft nahtlos weiter
-- **Echtes R15/R6-Rigging & T-Pose**: Lädt alle 15 Körperteile und Texturen einzeln und baut ein echtes Knochenskelett (Armature) auf. Der Avatar kann in neutraler T-Pose (Rest-Pose) gerendert oder beliebig posiert werden
-- **Präzise Fortschrittsanzeige & Restzeit**: Detaillierte Schritte (1 bis 5), dynamische geschätzte Restzeit und animierter Ladebalken im Roblox-GUI
-- **Interaktive Roblox-Steuerung**: Benutzername direkt im GUI eingeben und Rendern per Knopfdruck starten
-- **Roblox-Integration**: fertiges Bild wird stückweise als **EditableImage**-Pixelpuffer an Roblox übertragen und dort per RemoteEvent im Client in einem modernen Dark-GUI angezeigt
-- **Konfiguration per `.env`-Datei** (mit `06_config_bearbeiten.bat` bequem im Editor änderbar)
-- **Öffentliche HTTPS-Adresse** für veröffentlichte Spiele (`08_oeffentliche_adresse.bat`)
+- **BindableFunction `manage_render` in `ServerStorage`**:
+  - `"Create", FolderInstance` $\rightarrow$ Registriert neuen Render-Auftrag mit allen Avataren, Posen und 3D-Modellen
+  - `"Status", JobID` $\rightarrow$ Liefert den aktuellen Status (`queued`, `active`, `done`, `not_found`), Warteschlangen-Position und sekundengenaue Restzeitschätzung
+  - `"Download", JobID` $\rightarrow$ Lädt das fertige Bild stückweise als RGBA-Pixelbuffer für `EditableImage`
+- **Exakte Posen-Übernahme**: Überträgt die exakten CFrames (Position & 3D-Rotation) aller R15/R6-Körperteile aus Roblox Studio direkt nach Blender.
+- **Multi-Avatar & Szenen-Rendering**: Mehrere Avatare und Objekte können gleichzeitig in einer Szene gerendert werden.
+- **Spezial-Herzform-Hände (Heart Hands GFX)**: Ersetzt die Hände des Avatars automatisch durch ein 3D-Herz-Hände-Modell und passt die Hautfarbe an (`HeartHands = true`).
+- **Benutzerdefinierte 3D-Modelle (`assets/models/`)**: Eigene `.obj`-Modelle im Repository ablegen und per `ModelName`-Attribut in der Szene platzieren.
+- **3 Material-Modi**:
+  - `MATT`: Diffuser, matter Studio-Look
+  - `GLAS`: Signature-Klarlack-Glasur mit stufenloser Glanz-Stärke (`GlassStrength`)
+  - `DURCHSICHTIGES_GLAS`: Echtes, lichtbrechendes transparentes Glas
+- **Unendliche FIFO-Warteschlange**: Aufträge werden nacheinander sequenziell abgearbeitet.
+- **7-Tage-Aufbewahrung**: Fertige Render-Bilder werden auf dem Server gespeichert und nach 7 Tagen automatisch gelöscht.
+- **Token-Schutz**: Passwort in `.env` (`BRS_ACCESS_TOKEN`) und Lua-Skript (`RENDER_ACCESS_TOKEN`) schützt deinen Server vor fremden Zugriffen.
 
-## 🚀 Schnellstart (Windows)
+---
 
-| Schritt | Aktion |
-|---|---|
-| 1 | Repository herunterladen (grüner **Code**-Knopf → **Download ZIP**) und entpacken |
-| 2 | `01_setup.bat` doppelklicken (installiert alles, einmalig, ~10 Minuten) |
-| 3 | `02_start.bat` doppelklicken → Server läuft |
-| 4 | In Roblox Studio die zwei Skripte aus dem Ordner `roblox/` einfügen (Anleitung: [`ANLEITUNG.md`](ANLEITUNG.md)) |
-| 5 | Open-Cloud-API-Key mit Recht **thumbnails: Read** in die `.env` (sonst HTTP 403 beim 3D-Download) |
-| 6 | Optional: `04_autostart_installieren.bat` → startet künftig automatisch bei PC-Start |
-| 7 | Für ein **veröffentlichtes** Spiel: `08_oeffentliche_adresse.bat` und die `https://`-URL ins Lua-Skript |
+## 🚀 Schnellstart
 
-📖 **Die komplette, sehr ausführliche Anleitung für Anfänger steht in [`ANLEITUNG.md`](ANLEITUNG.md)!**
-🎮 Die Roblox-Studio-Einrichtung zusätzlich Schritt für Schritt: [`roblox/ANLEITUNG_ROBLOX.md`](roblox/ANLEITUNG_ROBLOX.md)
+1. `01_setup.bat` ausführen (installiert Python + Blender 4.5 automatisch).
+2. `06_config_bearbeiten.bat` ausführen: `ROBLOX_API_KEY` (und optional `BRS_ACCESS_TOKEN`) eintragen.
+3. `02_start.bat` starten.
+4. `roblox/RenderServerService.server.lua` in Roblox Studio in den `ServerScriptService` einfügen.
+5. In einem Script `manage_render:Invoke("Create", workspace.Folder)` aufrufen!
+
+📖 **Vollständige Anleitung & Attribute:** Siehe [`ANLEITUNG.md`](ANLEITUNG.md) und [`roblox/ANLEITUNG_ROBLOX.md`](roblox/ANLEITUNG_ROBLOX.md).
+
+---
 
 ## 📁 Ordnerstruktur
 
 ```
 BlenderRenderServer/
-├── 01_setup.bat                  ← 1x ausführen: installiert Python, Pakete, Blender
-├── 02_start.bat                  ← Server starten
-├── 03_stop.bat                   ← Server stoppen
-├── 04_autostart_installieren.bat ← Autostart bei PC-Start einrichten
-├── 05_autostart_entfernen.bat    ← Autostart entfernen
-├── 06_config_bearbeiten.bat      ← Einstellungen (.env) im Editor öffnen
-├── 07_im_browser_testen.bat      ← Statusseite im Browser öffnen
-├── 08_oeffentliche_adresse.bat   ← HTTPS-URL für veröffentlichte Spiele
-├── 09_verbindung_pruefen.bat     ← Roblox / GitHub / API-Key testen
-├── .env                          ← Deine Einstellungen (wird beim Setup erstellt)
-├── run.py                        ← Starter/Watchdog (von 02_start.bat benutzt)
-├── server/                       ← Der eigentliche Server-Code (Python)
-│   ├── app.py                    ← Web-API (FastAPI)
-│   ├── avatar.py                 ← Roblox-Avatar-Download (OBJ/MTL/Texturen)
-│   ├── blender_render.py         ← Rendering in Blender (Glas-Material, Cycles)
-│   ├── blender_runner.py         ← Findet & startet Blender
-│   ├── updater.py                ← Auto-Update von GitHub
-│   ├── tunnel.py                 ← Öffentliche HTTPS-Adresse (Cloudflare)
-│   └── diagnostics.py            ← Verbindungscheck (09_verbindung_pruefen.bat)
-├── roblox/                       ← Die zwei Lua-Skripte für Roblox Studio
-├── tools/blender/                ← Blender-Installation (kommt vom Setup)
-├── data/jobs/                    ← Gerenderte Bilder + heruntergeladene Avatare
-└── logs/                         ← Protokolle
+├── assets/
+│   ├── models/                   ← Eigene 3D-Modelle (z.B. Sword.obj, heart_hands.obj)
+│   └── hands/                    ← Spezial-Hände Modelle (heart_hands.obj)
+├── roblox/
+│   ├── RenderServerService.server.lua ← ServerScript mit manage_render BindableFunction
+│   └── ANLEITUNG_ROBLOX.md
+├── server/
+│   ├── app.py                    ← FastAPI Server & Warteschlange
+│   ├── avatar.py                 ← Roblox 3D Avatar Downloader
+│   ├── blender_render.py         ← Blender Cycles Szenen- & Material-Renderer
+│   ├── blender_runner.py         ← Blender Prozess-Starter
+│   └── config.py                 ← Konfiguration (.env) & 7-Tage-Retention
+├── data/jobs/                    ← Gespeicherte Render-Bilder (7 Tage Retention)
+├── 01_setup.bat / 02_start.bat
+└── ANLEITUNG.md                  ← Ausführliche Dokumentation
 ```
-
-## 🔌 API (für Fortgeschrittene)
-
-| Methode | Pfad | Beschreibung |
-|---|---|---|
-| GET | `/health` | Ist der Server erreichbar? (inkl. `api_key_set`, `public_url`) |
-| GET | `/diagnostics` | Roblox-3D-API, GitHub, Blender, API-Key prüfen |
-| POST | `/jobs` | Auftrag anlegen: `{"username": "Name"}` |
-| GET | `/jobs/current` | Status des aktuellen Auftrags (state, progress, ...) |
-| GET | `/jobs/{id}/image/info` | Bildgröße (wenn fertig) |
-| GET | `/jobs/{id}/image/rows?y=0&rows=16` | Rohe RGBA-Pixelzeilen (stückweise) |
-| GET | `/jobs/{id}/image.png` | Fertiges Bild als PNG |
-
-Zustände: `queued → downloading → loading → rendering → encoding → done` (oder `error`).
 
 ## 📝 Lizenz
 

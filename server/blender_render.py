@@ -1,18 +1,16 @@
-"""Blender-Render-Skript: Roblox-Avatar mit echtem R15/R6-Rig und Glas-Material in Cycles rendern.
+"""Blender-Render-Skript: Roblox-Szenen mit Avataren, Posen, Custom-3D-Modellen,
+Spezial-Haenden (Herzform) und 3 Material-Modi (MATT, GLAS, DURCHSICHTIGES_GLAS) in Cycles rendern.
 
 Funktionen:
-  - Baut ein vollstaendiges Knochenskelett (Armature) mit 15 Knochen (R15) oder 6 Knochen (R6)
-  - Laedt alle Koerperteile einzeln und bindet sie ueber Vertex-Groups & Armature-Modifier an die Knochen
-  - Ermoeglicht volles Posing sowie exaktes Zuruecksetzen in die unposed T-Pose (REST-Pose)
-  - Veredelt die Originaltexturen mit opaker, glasiger Klarlack-Schicht
+  - Unterstuetzt beliebig viele Avatare in einer Szene
+  - Exakte Uebernahme aller Roblox-Part-CFrames (Positionen & Rotationen fuer R15/R6-Posing)
+  - Ersetzt bei Bedarf die Haende durch ein Herzform-3D-Modell (Heart Hands)
+  - Laedt benutzerdefinierte 3D-Modelle aus assets/models/
+  - 3 Material-Modi pro Objekt/Avatar:
+      * MATT: Matter, diffuser Look
+      * GLAS: Veredelter Klarlack-Glas-Look mit prozentualer Staerke
+      * DURCHSICHTIGES_GLAS: Vollstaendig transparentes, lichtbrechendes Glas
   - Rendert in Cycles mit Live-Sample-Fortschritt
-
-Kann auf zwei Wegen ausgefuehrt werden:
-  a) In einer echten Blender-Installation via Subprozess:
-     blender --background --factory-startup --python blender_render.py -- \
-        --input MODELDIR --output BILD.png --width 1024 --height 1024 ...
-  b) In-process, wenn Blender als Pip-Modul installiert ist (import bpy):
-     from server.blender_render import render_scene
 """
 from __future__ import annotations
 
@@ -25,11 +23,58 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 # ------------------------------------------------------------------------------
-#  Hilfsfunktionen
+#  Hilfsfunktionen & Koordinaten-Transformation
 # ------------------------------------------------------------------------------
 
 def _log(msg: str) -> None:
     print(str(msg), flush=True)
+
+
+def cframe_to_blender_matrix(cf: list[float] | tuple[float, ...]):
+    """Wandelt ein 12-teiliges Roblox-CFrame in eine 4x4 Blender-Transformationsmatrix um.
+
+    Roblox CFrame: [x, y, z, R00, R01, R02, R10, R11, R12, R20, R21, R22]
+    Roblox-Koordinaten: +X=Rechts, +Y=Oben, +Z=Hinten (-Z=Vorwaerts)
+    Blender-Koordinaten: +X=Rechts, +Y=Vorwaerts/Tiefe, +Z=Oben
+    """
+    try:
+        from mathutils import Matrix
+    except ImportError:
+        Matrix = None
+
+    if not cf or len(cf) < 12:
+        return Matrix.Identity(4) if Matrix else [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]
+
+    x, y, z = float(cf[0]), float(cf[1]), float(cf[2])
+    r00, r01, r02 = float(cf[3]), float(cf[4]), float(cf[5])
+    r10, r11, r12 = float(cf[6]), float(cf[7]), float(cf[8])
+    r20, r21, r22 = float(cf[9]), float(cf[10]), float(cf[11])
+
+    # Blender-Spalten aus Roblox-Rotationsmatrix:
+    # Col 0 (Roblox X): [r00, -r20, r10]
+    # Col 1 (Roblox -Z): [-r02, r22, -r12]
+    # Col 2 (Roblox Y): [r01, -r21, r11]
+    # Position: [x, -z, y]
+    rows = (
+        (r00, -r02, r01, x),
+        (-r20, r22, -r21, -z),
+        (r10, -r12, r11, y),
+        (0.0, 0.0, 0.0, 1.0)
+    )
+    if Matrix:
+        return Matrix(rows)
+    return rows
+
+
+def roblox_pos_to_blender(pos: list[float] | tuple[float, ...]):
+    try:
+        from mathutils import Vector
+    except ImportError:
+        Vector = None
+    if not pos or len(pos) < 3:
+        return Vector((0.0, 0.0, 0.0)) if Vector else (0.0, 0.0, 0.0)
+    res = (float(pos[0]), -float(pos[2]), float(pos[1]))
+    return Vector(res) if Vector else res
 
 
 def _world_bbox(objs):
@@ -72,7 +117,7 @@ def _add_area_light(scene, name: str, energy: float, size: float, direction, dis
 
 
 def _setup_world(scene, environment_path: Optional[Path] = None):
-    """Richtet die Welt mit der mitgelieferten EXR-Umgebung oder Nishita-Himmel ein."""
+    """Richtet die Welt mit HDRI oder Nishita-Himmel ein."""
     import bpy
     from math import radians
 
@@ -103,40 +148,8 @@ def _setup_world(scene, environment_path: Optional[Path] = None):
     return world
 
 
-def _make_material_glassy(material):
-    """Macht ein importiertes, texturiertes Material glasig, aber opak."""
-    material.use_nodes = True
-    if hasattr(material, "blend_method"):
-        material.blend_method = "OPAQUE"
-    for bsdf in (n for n in material.node_tree.nodes if n.type == "BSDF_PRINCIPLED"):
-        inputs = bsdf.inputs
-        if "Roughness" in inputs:
-            inputs["Roughness"].default_value = 0.12
-        if "IOR" in inputs:
-            inputs["IOR"].default_value = 1.45
-        for socket in ("Transmission Weight", "Transmission"):
-            if socket in inputs:
-                inputs[socket].default_value = 0.0
-        for socket, value in (("Coat Weight", 0.85), ("Coat", 0.85),
-                              ("Coat Roughness", 0.04), ("Clearcoat Roughness", 0.04)):
-            if socket in inputs:
-                inputs[socket].default_value = value
-    return material
-
-
-def _select_all(objs):
-    import bpy
-
-    for obj in bpy.context.scene.objects:
-        obj.select_set(False)
-    for obj in objs:
-        obj.select_set(True)
-    if objs:
-        bpy.context.view_layer.objects.active = objs[0]
-
-
 def _setup_device(scene, device: str) -> str:
-    """Waehlt CPU/GPU. Gibt den tatsaechlich verwendeten Modus zurueck."""
+    """Waehlt CPU/GPU fuer Cycles."""
     import bpy
 
     if device in ("GPU", "AUTO"):
@@ -161,184 +174,110 @@ def _setup_device(scene, device: str) -> str:
 
 
 # ------------------------------------------------------------------------------
-#  R15 & R6 Armature / Knochenskelett-Erstellung
+#  Material-Modi (MATT, GLAS, DURCHSICHTIGES_GLAS)
 # ------------------------------------------------------------------------------
 
-def build_roblox_armature(scene, rig_type: str = "R15"):
-    """Erzeugt ein sauberes R15 oder R6 Knochenskelett (Armature) in neutraler T-Pose."""
-    import bpy
+def apply_material_mode(material, mode: str = "GLAS", glass_strength: float = 0.85,
+                        base_color: Optional[Tuple[float, float, float, float]] = None):
+    """Passt ein Material an einen der 3 Material-Modi an:
 
-    arm_data = bpy.data.armatures.new(f"RobloxRig_{rig_type}")
-    arm_obj = bpy.data.objects.new(f"RobloxRig_{rig_type}", arm_data)
-    scene.collection.objects.link(arm_obj)
-    bpy.context.view_layer.objects.active = arm_obj
-    
-    # In Edit-Mode Knochen anlegen (Blender: Z=Hoch, X=Rechts, Y=Tiefe)
-    bpy.ops.object.mode_set(mode="EDIT")
-    bones = arm_data.edit_bones
+      * MATT: Diffus, rau, matter Finish ohne Reflexionen
+      * GLAS: Opaker Farb-/Texturkörper mit eleganter Klarlack-Schicht (glass_strength 0..1)
+      * DURCHSICHTIGES_GLAS: Reales, transparentes lichtbrechendes Glas (Transmission 1.0)
+    """
+    if not material:
+        return
+    material.use_nodes = True
+    mode_str = str(mode or "GLAS").strip().upper()
 
-    if rig_type == "R6":
-        root = bones.new("HumanoidRootPart")
-        root.head = (0.0, 0.0, 3.0)
-        root.tail = (0.0, 0.0, 3.5)
+    # Normalisiere glass_strength (falls als 0..100 uebergeben)
+    if glass_strength > 1.0:
+        glass_strength = glass_strength / 100.0
+    glass_strength = max(0.0, min(1.0, float(glass_strength)))
 
-        torso = bones.new("Torso")
-        torso.head = (0.0, 0.0, 2.0)
-        torso.tail = (0.0, 0.0, 4.0)
-        torso.parent = root
+    tree = material.node_tree
+    bsdf = next((n for n in tree.nodes if n.type == "BSDF_PRINCIPLED"), None)
+    if not bsdf:
+        bsdf = tree.nodes.new("ShaderNodeBsdfPrincipled")
+        out = next((n for n in tree.nodes if n.type == "OUTPUT_MATERIAL"), None)
+        if not out:
+            out = tree.nodes.new("ShaderNodeOutputMaterial")
+        tree.links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
 
-        head = bones.new("Head")
-        head.head = (0.0, 0.0, 4.0)
-        head.tail = (0.0, 0.0, 5.2)
-        head.parent = torso
+    inputs = bsdf.inputs
 
-        la = bones.new("Left Arm")
-        la.head = (-1.5, 0.0, 4.0)
-        la.tail = (-1.5, 0.0, 2.0)
-        la.parent = torso
+    # Falls eine Basisfarbe angegeben wurde und kein Bild an Base Color haengt
+    if base_color and not inputs["Base Color"].is_linked:
+        inputs["Base Color"].default_value = base_color
 
-        ra = bones.new("Right Arm")
-        ra.head = (1.5, 0.0, 4.0)
-        ra.tail = (1.5, 0.0, 2.0)
-        ra.parent = torso
+    if mode_str in ("DURCHSICHTIGES_GLAS", "TRANSPARENT_GLAS", "CLEAR_GLASS"):
+        # Modus 3: Reales, durchsichtiges Glas
+        if hasattr(material, "blend_method"):
+            material.blend_method = "BLEND"
+        if "Transmission Weight" in inputs:
+            inputs["Transmission Weight"].default_value = 1.0
+        elif "Transmission" in inputs:
+            inputs["Transmission"].default_value = 1.0
+        if "Roughness" in inputs:
+            inputs["Roughness"].default_value = 0.05
+        if "IOR" in inputs:
+            inputs["IOR"].default_value = 1.52
+        for socket in ("Coat Weight", "Coat"):
+            if socket in inputs:
+                inputs[socket].default_value = glass_strength
+        for socket in ("Coat Roughness", "Clearcoat Roughness"):
+            if socket in inputs:
+                inputs[socket].default_value = 0.02
 
-        ll = bones.new("Left Leg")
-        ll.head = (-0.5, 0.0, 2.0)
-        ll.tail = (-0.5, 0.0, 0.0)
-        ll.parent = torso
-
-        rl = bones.new("Right Leg")
-        rl.head = (0.5, 0.0, 2.0)
-        rl.tail = (0.5, 0.0, 0.0)
-        rl.parent = torso
+    elif mode_str in ("MATT", "MATTE", "DIFFUSE"):
+        # Modus 1: Matt
+        if hasattr(material, "blend_method"):
+            material.blend_method = "OPAQUE"
+        if "Roughness" in inputs:
+            inputs["Roughness"].default_value = 0.65
+        if "IOR" in inputs:
+            inputs["IOR"].default_value = 1.45
+        for socket in ("Transmission Weight", "Transmission"):
+            if socket in inputs:
+                inputs[socket].default_value = 0.0
+        for socket in ("Coat Weight", "Coat"):
+            if socket in inputs:
+                inputs[socket].default_value = 0.0
 
     else:
-        # Standard R15: 15 Knochen
-        root = bones.new("HumanoidRootPart")
-        root.head = (0.0, 0.0, 3.0)
-        root.tail = (0.0, 0.0, 3.5)
-
-        lt = bones.new("LowerTorso")
-        lt.head = (0.0, 0.0, 2.6)
-        lt.tail = (0.0, 0.0, 3.4)
-        lt.parent = root
-
-        ut = bones.new("UpperTorso")
-        ut.head = (0.0, 0.0, 3.4)
-        ut.tail = (0.0, 0.0, 5.0)
-        ut.parent = lt
-
-        head = bones.new("Head")
-        head.head = (0.0, 0.0, 5.0)
-        head.tail = (0.0, 0.0, 6.2)
-        head.parent = ut
-
-        # Linker Arm
-        lua = bones.new("LeftUpperArm")
-        lua.head = (-1.4, 0.0, 4.6)
-        lua.tail = (-1.4, 0.0, 3.4)
-        lua.parent = ut
-
-        lla = bones.new("LeftLowerArm")
-        lla.head = (-1.4, 0.0, 3.4)
-        lla.tail = (-1.4, 0.0, 2.2)
-        lla.parent = lua
-
-        lh = bones.new("LeftHand")
-        lh.head = (-1.4, 0.0, 2.2)
-        lh.tail = (-1.4, 0.0, 1.4)
-        lh.parent = lla
-
-        # Rechter Arm
-        rua = bones.new("RightUpperArm")
-        rua.head = (1.4, 0.0, 4.6)
-        rua.tail = (1.4, 0.0, 3.4)
-        rua.parent = ut
-
-        rla = bones.new("RightLowerArm")
-        rla.head = (1.4, 0.0, 3.4)
-        rla.tail = (1.4, 0.0, 2.2)
-        rla.parent = rua
-
-        rh = bones.new("RightHand")
-        rh.head = (1.4, 0.0, 2.2)
-        rh.tail = (1.4, 0.0, 1.4)
-        rh.parent = rla
-
-        # Linkes Bein
-        lul = bones.new("LeftUpperLeg")
-        lul.head = (-0.55, 0.0, 2.6)
-        lul.tail = (-0.55, 0.0, 1.4)
-        lul.parent = lt
-
-        lll = bones.new("LeftLowerLeg")
-        lll.head = (-0.55, 0.0, 1.4)
-        lll.tail = (-0.55, 0.0, 0.2)
-        lll.parent = lul
-
-        lf = bones.new("LeftFoot")
-        lf.head = (-0.55, 0.0, 0.2)
-        lf.tail = (-0.55, 0.0, -0.6)
-        lf.parent = lll
-
-        # Rechtes Bein
-        rul = bones.new("RightUpperLeg")
-        rul.head = (0.55, 0.0, 2.6)
-        rul.tail = (0.55, 0.0, 1.4)
-        rul.parent = lt
-
-        rll = bones.new("RightLowerLeg")
-        rll.head = (0.55, 0.0, 1.4)
-        rll.tail = (0.55, 0.0, 0.2)
-        rll.parent = rul
-
-        rf = bones.new("RightFoot")
-        rf.head = (0.55, 0.0, 0.2)
-        rf.tail = (0.55, 0.0, -0.6)
-        rf.parent = rll
-
-    bpy.ops.object.mode_set(mode="OBJECT")
-    arm_data.pose_position = "REST"
-    _log(f"[Blender] {rig_type}-Armature mit {len(arm_data.bones)} Knochen aufgebaut (REST-Pose aktiv).")
-    return arm_obj
+        # Modus 2: Glas (Standard, opak mit edler Glasur)
+        if hasattr(material, "blend_method"):
+            material.blend_method = "OPAQUE"
+        if "Roughness" in inputs:
+            inputs["Roughness"].default_value = 0.12
+        if "IOR" in inputs:
+            inputs["IOR"].default_value = 1.45
+        for socket in ("Transmission Weight", "Transmission"):
+            if socket in inputs:
+                inputs[socket].default_value = 0.0
+        for socket in ("Coat Weight", "Coat"):
+            if socket in inputs:
+                inputs[socket].default_value = glass_strength
+        for socket in ("Coat Roughness", "Clearcoat Roughness"):
+            if socket in inputs:
+                inputs[socket].default_value = 0.04
 
 
-def bind_mesh_to_armature(mesh_obj, arm_obj, bone_name: str):
-    """Bindet ein Mesh-Objekt ueber eine Vertex-Gruppe an einen Knochen des Rigs."""
-    if bone_name not in arm_obj.data.bones:
-        # Fallback auf passenden Hauptknochen
-        if "Torso" in bone_name:
-            bone_name = "UpperTorso" if "UpperTorso" in arm_obj.data.bones else "Torso"
-        elif "Arm" in bone_name:
-            bone_name = "LeftUpperArm" if "Left" in bone_name else "RightUpperArm"
-        elif "Leg" in bone_name:
-            bone_name = "LeftUpperLeg" if "Left" in bone_name else "RightUpperLeg"
-        elif "Head" in bone_name or "Hair" in bone_name or "Hat" in bone_name or "Face" in bone_name:
-            bone_name = "Head"
-        else:
-            bone_name = "UpperTorso" if "UpperTorso" in arm_obj.data.bones else "Torso"
-
-    if bone_name in arm_obj.data.bones:
-        vg = mesh_obj.vertex_groups.get(bone_name)
-        if not vg:
-            vg = mesh_obj.vertex_groups.new(name=bone_name)
-        all_verts = [v.index for v in mesh_obj.data.vertices]
-        if all_verts:
-            vg.add(all_verts, 1.0, "REPLACE")
-
-    mesh_obj.parent = arm_obj
-    mod = mesh_obj.modifiers.get("Armature")
-    if not mod:
-        mod = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
-    mod.object = arm_obj
-    mod.use_vertex_groups = True
+def _create_color_material(name: str, color: Tuple[float, float, float, float],
+                           mode: str = "GLAS", glass_strength: float = 0.85):
+    import bpy
+    mat = bpy.data.materials.new(name=name)
+    apply_material_mode(mat, mode=mode, glass_strength=glass_strength, base_color=color)
+    return mat
 
 
-def _match_bone_for_obj(obj_name: str, center_z: float, center_x: float) -> str:
-    """Bestimmt anhand des Namens oder der Position den zugehoerigen R15-Knochen."""
+# ------------------------------------------------------------------------------
+#  Knochen- und Part-Erkennung fuer Roblox Avatare
+# ------------------------------------------------------------------------------
+
+def _match_bone_for_obj(obj_name: str, center_z: float = 0.0, center_x: float = 0.0) -> str:
+    """Ermittelt das zugehoerige R15-Koerperteil anhand des Namens oder der Position."""
     name_lower = obj_name.lower()
-    
-    # Exakte Namensuebereinstimmung
     for b in ("LeftUpperArm", "LeftLowerArm", "LeftHand",
               "RightUpperArm", "RightLowerArm", "RightHand",
               "LeftUpperLeg", "LeftLowerLeg", "LeftFoot",
@@ -347,13 +286,11 @@ def _match_bone_for_obj(obj_name: str, center_z: float, center_x: float) -> str:
         if b.lower() in name_lower:
             return b
 
-    # Accessoires
     if any(k in name_lower for k in ("hat", "hair", "face", "glass", "horn", "cap")):
         return "Head"
     if any(k in name_lower for k in ("back", "wing", "cape", "shoulder", "sword", "shield")):
         return "UpperTorso"
 
-    # Positionsbasierte Zuordnung
     if center_z > 4.8:
         return "Head"
     elif center_z > 3.4:
@@ -375,11 +312,257 @@ def _match_bone_for_obj(obj_name: str, center_z: float, center_x: float) -> str:
 
 
 # ------------------------------------------------------------------------------
+#  Szenen-Aufbau: Avatare, Custom-Modelle, Herz-Haende
+# ------------------------------------------------------------------------------
+
+def _find_custom_model_file(model_name: str, search_dirs: list[Path]) -> Optional[Path]:
+    """Sucht nach einer benutzerdefinierten 3D-Datei im Repository."""
+    if not model_name:
+        return None
+    extensions = (".obj", ".glb", ".gltf", ".fbx")
+    cleaned = Path(model_name).stem.lower()
+
+    for directory in search_dirs:
+        if not directory.is_dir():
+            continue
+        # Exakte Uebereinstimmung
+        for ext in extensions:
+            cand = directory / f"{model_name}{ext}"
+            if cand.is_file():
+                return cand
+        # Case-insensitive Suche
+        for f in directory.iterdir():
+            if f.is_file() and f.stem.lower() == cleaned and f.suffix.lower() in extensions:
+                return f
+    return None
+
+
+def _import_obj_mesh(filepath: Path) -> list:
+    """Importiert eine OBJ-Datei in die aktuelle Szene und gibt alle neuen Meshes zurueck."""
+    import bpy
+    before = set(bpy.context.scene.objects)
+    bpy.ops.wm.obj_import(filepath=str(filepath))
+    after = set(bpy.context.scene.objects)
+    return [o for o in (after - before) if o.type == "MESH"]
+
+
+def _process_avatar(scene, avatar_spec: dict, repo_root: Path, all_scene_meshes: list):
+    """Laedt einen Avatar, wendet die Posen aller Koerperteile an und fuegt Herz-Haende ein."""
+    import bpy
+    from math import radians
+    from mathutils import Matrix, Vector
+
+    username = avatar_spec.get("username", "Avatar")
+    model_dir_str = avatar_spec.get("model_dir")
+    model_dir = Path(model_dir_str) if model_dir_str else repo_root / "data" / "jobs" / "model"
+    
+    mat_mode = avatar_spec.get("material_mode", "GLAS")
+    glass_strength = float(avatar_spec.get("glass_strength", 0.85))
+    heart_hands = bool(avatar_spec.get("heart_hands", False))
+    skin_color_list = avatar_spec.get("skin_color") or [245, 205, 170]
+    skin_color_rgba = (
+        skin_color_list[0] / 255.0,
+        skin_color_list[1] / 255.0,
+        skin_color_list[2] / 255.0,
+        1.0,
+    )
+    parts_data = avatar_spec.get("parts") or {}
+
+    obj_file = model_dir / "avatar.obj"
+    if not obj_file.is_file():
+        # Suche nach beliebigem OBJ im Ordner
+        objs = list(model_dir.glob("*.obj"))
+        if objs:
+            obj_file = objs[0]
+        else:
+            _log(f"[Blender] Warnung: Kein OBJ fuer Avatar '{username}' in {model_dir} gefunden.")
+            return
+
+    _log(f"[Blender] Lade Avatar '{username}' aus {obj_file.name} (Modus: {mat_mode}, Herz-Haende: {heart_hands}) ...")
+    avatar_meshes = _import_obj_mesh(obj_file)
+    if not avatar_meshes:
+        return
+
+    # Grundausrichtung des OBJ (Roblox Y-hoch -> Blender Z-hoch)
+    bpy.ops.object.select_all(action="DESELECT")
+    for m in avatar_meshes:
+        m.select_set(True)
+    bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+    
+    mn, mx = _world_bbox(avatar_meshes)
+    if (mx.y - mn.y) > (mx.z - mn.z) * 1.3 and (mx.y - mn.y) > (mx.x - mn.x):
+        for m in avatar_meshes:
+            m.rotation_euler.rotate_axis("X", radians(90))
+        bpy.context.view_layer.update()
+        bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
+
+    # Koerperteil-Zuordnung & Posing
+    left_hand_cframe = None
+    right_hand_cframe = None
+
+    kept_avatar_meshes = []
+    for obj in avatar_meshes:
+        obj_mn, obj_mx = _world_bbox([obj])
+        obj_center = (obj_mn + obj_mx) / 2
+        bone_name = _match_bone_for_obj(obj.name, obj_center.z, obj_center.x)
+
+        # Bei Herz-Haenden werden die Original-Haende geloescht
+        if heart_hands and bone_name in ("LeftHand", "RightHand"):
+            # Speichere die CFrame der Haende fuer die Positionierung des Herz-Modells
+            if bone_name == "LeftHand" and "LeftHand" in parts_data:
+                left_hand_cframe = parts_data["LeftHand"].get("cframe")
+            if bone_name == "RightHand" and "RightHand" in parts_data:
+                right_hand_cframe = parts_data["RightHand"].get("cframe")
+            bpy.data.objects.remove(obj, do_unlink=True)
+            continue
+
+        kept_avatar_meshes.append(obj)
+
+        # Wenn Posen-Daten fuer dieses Koerperteil vorhanden sind -> transformieren
+        if bone_name in parts_data and parts_data[bone_name].get("cframe"):
+            cf = parts_data[bone_name]["cframe"]
+            target_matrix = cframe_to_blender_matrix(cf)
+            
+            # Ursprung auf Zentrum setzen und an Zielmatrix ausrichten
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.origin_set(type="ORIGIN_GEOMETRY", center="BOUNDS")
+            obj.matrix_world = target_matrix
+        elif avatar_spec.get("cframe"):
+            # Fallback: gesamter Avatar an Basis-CFrame
+            obj.matrix_world = cframe_to_blender_matrix(avatar_spec["cframe"])
+
+        # Material anpassen
+        for mat in obj.data.materials:
+            if mat:
+                apply_material_mode(mat, mode=mat_mode, glass_strength=glass_strength)
+        
+        for poly in obj.data.polygons:
+            poly.use_smooth = True
+
+    all_scene_meshes.extend(kept_avatar_meshes)
+
+    # Herz-Haende einfuegen, falls gewuenscht
+    if heart_hands:
+        hands_file = _find_custom_model_file("heart_hands", [
+            repo_root / "assets" / "models",
+            repo_root / "assets" / "hands",
+            repo_root / "assets",
+        ])
+        if hands_file and hands_file.is_file():
+            _log(f"[Blender] Fuege Herz-Haende ({hands_file.name}) fuer '{username}' ein ...")
+            hand_meshes = _import_obj_mesh(hands_file)
+            
+            # Positionierung: Mitte zwischen linker und rechter Hand
+            if left_hand_cframe and right_hand_cframe:
+                m_l = cframe_to_blender_matrix(left_hand_cframe)
+                m_r = cframe_to_blender_matrix(right_hand_cframe)
+                pos_mid = (m_l.to_translation() + m_r.to_translation()) / 2.0
+                target_mat = m_l.copy()
+                target_mat.translation = pos_mid
+            elif left_hand_cframe:
+                target_mat = cframe_to_blender_matrix(left_hand_cframe)
+            elif right_hand_cframe:
+                target_mat = cframe_to_blender_matrix(right_hand_cframe)
+            elif "UpperTorso" in parts_data and parts_data["UpperTorso"].get("cframe"):
+                # Vor die Brust platzieren
+                m_torso = cframe_to_blender_matrix(parts_data["UpperTorso"]["cframe"])
+                target_mat = m_torso.copy()
+                target_mat.translation = target_mat.translation + target_mat.to_3x3() @ Vector((0.0, 0.6, 0.0))
+            else:
+                target_mat = Matrix.Translation((0.0, 0.0, 3.5))
+
+            skin_mat = _create_color_material(
+                f"HeartSkin_{username}",
+                skin_color_rgba,
+                mode=mat_mode,
+                glass_strength=glass_strength
+            )
+
+            for hm in hand_meshes:
+                bpy.context.view_layer.objects.active = hm
+                bpy.ops.object.origin_set(type="ORIGIN_GEOMETRY", center="BOUNDS")
+                hm.matrix_world = target_mat
+                hm.data.materials.clear()
+                hm.data.materials.append(skin_mat)
+                for poly in hm.data.polygons:
+                    poly.use_smooth = True
+                all_scene_meshes.append(hm)
+
+
+def _process_custom_object(scene, obj_spec: dict, repo_root: Path, all_scene_meshes: list):
+    """Laedt ein benutzerdefiniertes 3D-Modell (MeshPart) oder erzeugt eine Box."""
+    import bpy
+    from mathutils import Matrix, Vector
+
+    model_name = obj_spec.get("model_name") or obj_spec.get("name", "CustomPart")
+    mat_mode = obj_spec.get("material_mode", "MATT")
+    glass_strength = float(obj_spec.get("glass_strength", 0.85))
+    size = obj_spec.get("size") or [1.0, 1.0, 1.0]
+    color_list = obj_spec.get("color") or [200, 200, 200]
+    color_rgba = (
+        color_list[0] / 255.0,
+        color_list[1] / 255.0,
+        color_list[2] / 255.0,
+        1.0,
+    )
+    cf = obj_spec.get("cframe")
+    target_matrix = cframe_to_blender_matrix(cf) if cf else Matrix.Identity(4)
+
+    # Suche in assets/models und assets/
+    model_file = _find_custom_model_file(model_name, [
+        repo_root / "assets" / "models",
+        repo_root / "assets" / "hands",
+        repo_root / "assets",
+    ])
+
+    if model_file and model_file.is_file():
+        _log(f"[Blender] Lade Custom-Modell '{model_name}' aus {model_file.name} ...")
+        meshes = _import_obj_mesh(model_file)
+        if meshes:
+            for m in meshes:
+                bpy.context.view_layer.objects.active = m
+                bpy.ops.object.origin_set(type="ORIGIN_GEOMETRY", center="BOUNDS")
+                m.matrix_world = target_matrix
+                
+                # Skalierung anhand Roblox Size anpassen
+                if size:
+                    # In Blender: x=sx, y=sz, z=sy
+                    sx, sy, sz = float(size[0]), float(size[1]), float(size[2])
+                    m.scale = (sx, sz, sy)
+
+                if not m.data.materials:
+                    mat = _create_color_material(f"Mat_{model_name}", color_rgba, mode=mat_mode, glass_strength=glass_strength)
+                    m.data.materials.append(mat)
+                else:
+                    for mat in m.data.materials:
+                        if mat:
+                            apply_material_mode(mat, mode=mat_mode, glass_strength=glass_strength)
+
+                for poly in m.data.polygons:
+                    poly.use_smooth = True
+                all_scene_meshes.append(m)
+            return
+
+    # Fallback: erstelle primitive Box mit Roblox-Farbe und Material
+    _log(f"[Blender] Erstelle Primitive fuer Part '{model_name}' (Farbe: {color_list}, Modus: {mat_mode}) ...")
+    sx, sy, sz = float(size[0]), float(size[1]), float(size[2])
+    bpy.ops.mesh.primitive_cube_add(size=1.0)
+    cube = bpy.context.active_object
+    cube.name = model_name
+    cube.scale = (sx, sz, sy)
+    cube.matrix_world = target_matrix
+    
+    mat = _create_color_material(f"Mat_{model_name}", color_rgba, mode=mat_mode, glass_strength=glass_strength)
+    cube.data.materials.append(mat)
+    all_scene_meshes.append(cube)
+
+
+# ------------------------------------------------------------------------------
 #  Hauptfunktion
 # ------------------------------------------------------------------------------
 
 def render_scene(params: dict, progress=None) -> None:
-    """Rendert das Modell aus params['input'] voll geriggt nach params['output']."""
+    """Rendert die vollstaendige Szene (Avatare, Custom-Modelle, Posen) in Cycles."""
     import bpy
     from math import radians, tan
     from mathutils import Vector
@@ -396,154 +579,114 @@ def render_scene(params: dict, progress=None) -> None:
     width = int(params.get("width", 1024))
     height = int(params.get("height", 1024))
     samples = int(params.get("samples", 96))
-    material_mode = str(params.get("material", "glass")).lower()
     device = str(params.get("device", "CPU")).upper()
+    repo_root = Path(__file__).resolve().parent.parent
 
     # 1) Frische, leere Szene ---------------------------------------------------
     bpy.ops.wm.read_factory_settings(use_empty=True)
     scene = bpy.context.scene
     report("loading", 0.05)
 
-    # 2) Manifest pruefen / Mesh-Import -----------------------------------------
-    manifest_path = input_dir / "manifest.json"
-    manifest_data = {}
-    if manifest_path.exists():
+    # 2) Manifest / Szene laden ------------------------------------------------
+    scene_file = input_dir / "scene.json"
+    manifest_file = input_dir / "manifest.json"
+    
+    scene_data: Dict[str, Any] = {}
+    if scene_file.is_file():
         try:
-            manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            scene_data = json.loads(scene_file.read_text(encoding="utf-8"))
+        except Exception as exc:
+            _log(f"[Blender] Fehler beim Lesen von scene.json: {exc}")
+    elif manifest_file.is_file():
+        try:
+            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+            scene_data = {
+                "avatars": [{
+                    "username": manifest.get("username", "Avatar"),
+                    "model_dir": str(input_dir),
+                    "material_mode": params.get("material", "GLAS"),
+                    "glass_strength": 0.85,
+                    "heart_hands": False,
+                }]
+            }
         except Exception:
             pass
 
-    rig_type = manifest_data.get("rig_type", "R15")
-    _log(f"[Blender] Erstelle {rig_type}-Avatar-Rig ...")
-    armature_obj = build_roblox_armature(scene, rig_type)
+    if not scene_data.get("avatars") and not scene_data.get("objects"):
+        # Fallback auf Standard-Avatar im input_dir
+        scene_data = {
+            "avatars": [{
+                "username": "Default",
+                "model_dir": str(input_dir),
+                "material_mode": params.get("material", "GLAS"),
+                "glass_strength": 0.85,
+                "heart_hands": False,
+            }]
+        }
+
+    all_scene_meshes = []
     report("loading", 0.2)
 
-    # Pruefen ob einzelne Part-OBJs vorhanden sind
-    part_files = list(input_dir.glob("*.obj"))
-    individual_parts = [p for p in part_files if p.name != "avatar.obj"]
+    # 3) Avatare laden und posieren --------------------------------------------
+    avatars_list = scene_data.get("avatars") or []
+    for av_spec in avatars_list:
+        _process_avatar(scene, av_spec, repo_root, all_scene_meshes)
 
-    imported_meshes = []
+    report("loading", 0.5)
 
-    if individual_parts:
-        _log(f"[Blender] Lade {len(individual_parts)} einzelne Koerperteile & Accessoires ...")
-        for part_p in individual_parts:
-            part_name = part_p.stem
-            bpy.ops.wm.obj_import(filepath=str(part_p))
-            new_objs = [o for o in scene.objects if o.type == "MESH" and o not in imported_meshes]
-            for obj in new_objs:
-                bone_name = part_name
-                for p_meta in manifest_data.get("parts", []):
-                    if p_meta.get("name") == part_name:
-                        bone_name = p_meta.get("bone", part_name)
-                        break
-                bind_mesh_to_armature(obj, armature_obj, bone_name)
-                imported_meshes.append(obj)
-    else:
-        # Standard avatar.obj importieren
-        obj_path = input_dir / "avatar.obj"
-        if not obj_path.exists():
-            raise RuntimeError(f"Weder Koerperteile noch avatar.obj gefunden in {input_dir}")
-        _log(f"[Blender] Importiere {obj_path} ...")
-        bpy.ops.wm.obj_import(filepath=str(obj_path))
-        imported_meshes = [o for o in scene.objects if o.type == "MESH"]
+    # 4) Custom 3D Modelle & Parts laden ---------------------------------------
+    objects_list = scene_data.get("objects") or []
+    for obj_spec in objects_list:
+        _process_custom_object(scene, obj_spec, repo_root, all_scene_meshes)
 
-    if not imported_meshes:
-        raise RuntimeError("Im Modell wurden keine Meshes gefunden.")
-    _log(f"[Blender] {len(imported_meshes)} Mesh-Objekte geladen.")
-    report("loading", 0.4)
+    if not all_scene_meshes:
+        raise RuntimeError("In der Szene wurden keine 3D-Objekte oder Avatare gefunden.")
 
-    # 3) Transformationen einbacken & Ausrichtung --------------------------------
-    bpy.context.view_layer.update()
-    _select_all(imported_meshes)
-    bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+    _log(f"[Blender] Gesamt geladen: {len(all_scene_meshes)} 3D-Meshes.")
+    report("loading", 0.7)
 
-    mn, mx = _world_bbox(imported_meshes)
-    _log(f"[Blender] Modell-Ausmasse: x={mx.x - mn.x:.2f} y={mx.y - mn.y:.2f} z={mx.z - mn.z:.2f}")
-    if (mx.y - mn.y) > (mx.z - mn.z) * 1.3 and (mx.y - mn.y) > (mx.x - mn.x):
-        _log("[Blender] Modell liegt 'flach' (Y-hoch) -> wird aufgerichtet.")
-        _select_all(imported_meshes)
-        for obj in imported_meshes:
-            obj.rotation_euler.rotate_axis("X", radians(90))
-        bpy.context.view_layer.update()
-        bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
-    report("loading", 0.6)
-
-    # 4) Zentrieren & Skalieren -------------------------------------------------
-    mn, mx = _world_bbox(imported_meshes)
-    center = (mn + mx) / 2
-    max_dim = max(mx.x - mn.x, mx.y - mn.y, mx.z - mn.z) or 1.0
-    scale = 2.2 / max_dim
-    _select_all(imported_meshes)
-    for obj in imported_meshes:
-        obj.location = (obj.location.x - center.x, obj.location.y - center.y, obj.location.z - center.z)
-        obj.scale = (obj.scale.x * scale, obj.scale.y * scale, obj.scale.z * scale)
-    bpy.context.view_layer.update()
-    bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
-
-    # Armature ebenfalls anpassen & Knochen mit Meshes verknuepfen
-    if not individual_parts:
-        for obj in imported_meshes:
-            obj_mn, obj_mx = _world_bbox([obj])
-            obj_center = (obj_mn + obj_mx) / 2
-            bone_name = _match_bone_for_obj(obj.name, obj_center.z, obj_center.x)
-            bind_mesh_to_armature(obj, armature_obj, bone_name)
-
-    # Skelett sicher in die REST-Pose versetzen (neutral unposed)
-    armature_obj.data.pose_position = "REST"
-    for pose_bone in armature_obj.pose.bones:
-        pose_bone.location = (0.0, 0.0, 0.0)
-        pose_bone.rotation_quaternion = (1.0, 0.0, 0.0, 0.0)
-        pose_bone.rotation_euler = (0.0, 0.0, 0.0)
-        pose_bone.scale = (1.0, 1.0, 1.0)
-
-    # Frontal zur Kamera ausrichten
-    _select_all(imported_meshes)
-    for obj in imported_meshes:
-        obj.rotation_euler.rotate_axis("Z", radians(180))
-    bpy.context.view_layer.update()
-    bpy.ops.object.transform_apply(location=False, rotation=True, scale=False)
-    report("loading", 0.8)
-
-    # 5) Material: Originaltexturen plus opake Glasur ---------------------------
-    if material_mode == "glass":
-        _log("[Blender] Veredle Originalmaterialien opak und glasig ...")
-        seen_materials = set()
-        for obj in imported_meshes:
-            for material in obj.data.materials:
-                if material is not None and material.name not in seen_materials:
-                    _make_material_glassy(material)
-                    seen_materials.add(material.name)
-
-    for obj in imported_meshes:
-        for poly in obj.data.polygons:
-            poly.use_smooth = True
-    report("loading", 1.0)
-
-    # 6) Licht + Umgebung -------------------------------------------------------
-    environment_path = Path(__file__).resolve().parent.parent / "sunset_jhbcentral_4k.exr"
+    # 5) Licht & Welt ----------------------------------------------------------
+    environment_path = repo_root / "sunset_jhbcentral_4k.exr"
     _setup_world(scene, environment_path)
-    _add_area_light(scene, "BRS_Key", 500, 4.0, (1.5, -1.3, 1.7), 7.0)
-    _add_area_light(scene, "BRS_Rim", 250, 3.0, (-1.7, 1.3, 1.0), 7.0)
-    _add_area_light(scene, "BRS_Fill", 120, 6.0, (-0.6, -1.7, 0.3), 8.0)
+    
+    # 3-Punkt-Beleuchtung
+    mn, mx = _world_bbox(all_scene_meshes)
+    center = (mn + mx) / 2.0
+    radius = max(mx.x - mn.x, mx.y - mn.y, mx.z - mn.z) / 2.0 or 1.0
 
-    # 7) Kamera ausrichten ------------------------------------------------------
-    mn, mx = _world_bbox(imported_meshes)
-    center = (mn + mx) / 2
-    radius = max(mx.x - mn.x, mx.y - mn.y, mx.z - mn.z) / 2 or 1.0
-    fov_deg = 32.0
-    distance = radius / tan(radians(fov_deg) / 2.0) * 1.3 + radius * 0.6
-    direction = Vector((0.0, -1.0, 0.12)).normalized()
+    _add_area_light(scene, "BRS_Key", 600, 4.0, (1.5, -1.3, 1.7), radius * 3.5)
+    _add_area_light(scene, "BRS_Rim", 350, 3.0, (-1.7, 1.3, 1.0), radius * 3.5)
+    _add_area_light(scene, "BRS_Fill", 180, 6.0, (-0.6, -1.7, 0.3), radius * 4.0)
+
+    # 6) Kamera einrichten ------------------------------------------------------
     cam_data = bpy.data.cameras.new("BRS_Cam")
-    cam_data.lens_unit = "FOV"
-    cam_data.angle = radians(fov_deg)
     camera = bpy.data.objects.new("BRS_Cam", cam_data)
     scene.collection.objects.link(camera)
-    camera.location = center + direction * distance
-    aim = (center - camera.location).normalized()
-    camera.rotation_euler = aim.to_track_quat("-Z", "Y").to_euler()
     scene.camera = camera
 
-    # 8) Render-Einstellungen ---------------------------------------------------
+    cam_spec = scene_data.get("camera") or {}
+    fov_deg = float(cam_spec.get("fov", 32.0))
+    cam_data.lens_unit = "FOV"
+    cam_data.angle = radians(fov_deg)
+
+    if cam_spec.get("position") and cam_spec.get("position") != [0, 0, 0]:
+        # Benutzerdefinierte Kameraposition
+        cam_pos = roblox_pos_to_blender(cam_spec["position"])
+        target_pos = roblox_pos_to_blender(cam_spec.get("target", [0, 0, 0]))
+        camera.location = cam_pos
+        aim = (target_pos - cam_pos).normalized()
+        camera.rotation_euler = aim.to_track_quat("-Z", "Y").to_euler()
+    else:
+        # Standard: Kamera bei (0,0,0) in Richtung der Szene / Vorwaerts (+Y)
+        distance = radius / tan(radians(fov_deg) / 2.0) * 1.3 + radius * 0.5
+        direction = Vector((0.0, -1.0, 0.08)).normalized()
+        camera.location = center + direction * distance
+        aim = (center - camera.location).normalized()
+        camera.rotation_euler = aim.to_track_quat("-Z", "Y").to_euler()
+
+    report("loading", 0.9)
+
+    # 7) Render-Einstellungen (Cycles) ------------------------------------------
     scene.render.engine = "CYCLES"
     used_device = _setup_device(scene, device)
     scene.cycles.samples = samples
@@ -551,6 +694,7 @@ def render_scene(params: dict, progress=None) -> None:
         scene.cycles.use_denoising = True
     except Exception:
         pass
+
     scene.render.resolution_x = width
     scene.render.resolution_y = height
     scene.render.resolution_percentage = 100
@@ -559,12 +703,12 @@ def render_scene(params: dict, progress=None) -> None:
     scene.render.image_settings.color_mode = "RGBA"
     scene.render.filepath = output
 
-    # 9) Rendern ----------------------------------------------------------------
+    # 8) Rendern ----------------------------------------------------------------
     _log(f"[Blender] Rendern startet ({width}x{height}, {samples} Samples, {used_device}) ...")
     report("rendering", 0.0)
     bpy.ops.render.render(write_still=True)
     report("rendering", 1.0)
-    _log(f"[Blender] Fertig, gerendertes Bild gespeichert: {output}")
+    _log(f"[Blender] Fertig! Render-Bild gespeichert: {output}")
 
 
 # ------------------------------------------------------------------------------
@@ -572,13 +716,13 @@ def render_scene(params: dict, progress=None) -> None:
 # ------------------------------------------------------------------------------
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Roblox-Avatar als Rig in Glas rendern")
-    parser.add_argument("--input", required=True, help="Ordner mit avatar.obj / part files")
+    parser = argparse.ArgumentParser(description="Roblox-Szene mit Avataren, Posen und Custom-Modellen rendern")
+    parser.add_argument("--input", required=True, help="Ordner mit scene.json / avatar.obj")
     parser.add_argument("--output", required=True, help="Ziel-PNG")
     parser.add_argument("--width", type=int, default=1024)
     parser.add_argument("--height", type=int, default=1024)
     parser.add_argument("--samples", type=int, default=96)
-    parser.add_argument("--material", default="glass")
+    parser.add_argument("--material", default="GLAS")
     parser.add_argument("--device", default="CPU")
     return parser
 

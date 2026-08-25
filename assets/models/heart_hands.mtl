@@ -1,0 +1,7 @@
+# Special Heart Hands Material
+newmtl SkinMat
+Ka 1.0 1.0 1.0
+Kd 0.96 0.80 0.69
+Ks 0.1 0.1 0.1
+d 1.0
+illum 2
