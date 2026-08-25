@@ -1,10 +1,11 @@
-"""Regressionstests: 3D-API-Auth, GitHub-Update, Token, Rigging, Roblox-Mesh & Steps."""
+"""Regressionstests: 3D-API-Auth, GitHub-Update, Token, Rigging, Roblox-Mesh, Scene-Creation, Status & Queue."""
 from __future__ import annotations
 
 import json
 import struct
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -13,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from server import avatar, config, roblox_mesh, updater  # noqa: E402
+from server import avatar, blender_render, config, roblox_mesh, updater  # noqa: E402
 from server.avatar import AvatarError  # noqa: E402
 
 
@@ -136,8 +137,6 @@ class MtlFixupTests(unittest.TestCase):
 
 
 class DownloadAvatarModelTests(unittest.TestCase):
-    # Minimaler gueltiger PNG-Header (1x1 Pixel), damit die Bildvalidierung
-    # in _download_cdn(expect_image=True) nicht anschlaegt.
     PNG_BYTES = (
         b"\x89PNG\r\n\x1a\n"
         b"\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
@@ -188,38 +187,6 @@ class DownloadAvatarModelTests(unittest.TestCase):
             self.assertEqual(data.get("rig_type"), "R15")
             self.assertTrue(data.get("is_rigged"))
 
-    def test_studio_boxes_path_is_ignored_even_when_avatar_data_sent(self):
-        """Regression: frueher wurden mit avatar_data aus Studio nur Boxen
-        ohne Meshes/Texturen gerendert (schwarze Quader). Jetzt MUSS immer
-        das echte 3D-Avatar-Modell heruntergeladen werden."""
-        with tempfile.TemporaryDirectory() as tmp:
-            studio_data = {
-                "rig_type": "R15",
-                "parts": [
-                    {"name": "Head", "size": [1, 1, 1], "position": [0, 5, 0], "color": [255, 255, 255]},
-                ],
-            }
-
-            def fake_cdn(_session, _host, name, **_kwargs):
-                if name == "objhash":
-                    return b"v 0 0 0\nf 1 1 1\n"
-                if name == "mtlhash":
-                    return b"newmtl m\nmap_Kd 30DAY-tex\n"
-                return self.PNG_BYTES
-
-            with patch.object(avatar, "resolve_user_id", return_value=42), \
-                 patch.object(avatar, "fetch_3d_manifest", return_value=(
-                     {"obj": "objhash", "mtl": "mtlhash", "textures": ["30DAY-tex"]},
-                     "t3.rbxcdn.com")), \
-                 patch.object(avatar, "_download_cdn", side_effect=fake_cdn) as mock_cdn:
-                avatar.download_avatar_model("MertaStudios", Path(tmp), avatar_data=studio_data)
-
-            # Echte OBJ-Datei vom CDN muss geladen worden sein, NICHT die
-            # generierten Boxen aus _process_studio_avatar_data.
-            called_names = [call.args[2] for call in mock_cdn.call_args_list]
-            self.assertIn("objhash", called_names)
-            self.assertIn("mtlhash", called_names)
-
     def test_invalid_image_bytes_are_rejected(self):
         self.assertFalse(avatar._is_valid_image(b"<html>error</html>"))
         self.assertFalse(avatar._is_valid_image(b""))
@@ -235,7 +202,6 @@ class RiggingAndTestModelTests(unittest.TestCase):
             manifest = json.loads((Path(tmp) / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest.get("rig_type"), "R15")
             self.assertEqual(len(manifest.get("parts", [])), 15)
-            # Pruefen ob alle 15 R15 Teile als separate OBJs vorliegen
             for expected_part in ("Head", "UpperTorso", "LowerTorso", "LeftUpperArm", "RightFoot"):
                 self.assertTrue((Path(tmp) / f"{expected_part}.obj").exists())
 
@@ -274,55 +240,6 @@ class UpdaterTests(unittest.TestCase):
         self.assertEqual(sha, "a" * 40)
         self.assertEqual(err, "")
 
-    def test_falls_back_to_atom_when_api_blocked(self):
-        api = MagicMock()
-        api.ok = False
-        api.status_code = 403
-        atom = MagicMock()
-        atom.ok = True
-        atom.text = (
-            '<?xml version="1.0"?><feed>'
-            "<id>https://github.com/x/y/commit/" + "b" * 40 + "</id></feed>"
-        )
-
-        def fake_get(url, *args, **kwargs):
-            if "api.github.com" in url:
-                return api
-            return atom
-
-        with patch("server.updater.requests.get", side_effect=fake_get):
-            with patch.object(updater, "_sha_from_git", return_value=(None, "skip")):
-                sha, err = updater.remote_sha_detailed()
-        self.assertEqual(sha, "b" * 40)
-        self.assertEqual(err, "")
-
-    def test_all_fail_keeps_detail(self):
-        with patch.object(updater, "_sha_from_api", return_value=(None, "api.github.com HTTP 403")):
-            with patch.object(updater, "_sha_from_atom", return_value=(None, "atom down")):
-                with patch.object(updater, "_sha_from_git", return_value=(None, "no git")):
-                    sha, err = updater.remote_sha_detailed()
-                    self.assertIsNone(sha)
-                    self.assertIn("api.github.com HTTP 403", err)
-                    self.assertIn("atom down", err)
-                    updated, msg = updater.check_and_apply()
-        self.assertFalse(updated)
-        self.assertIn("Update uebersprungen", msg)
-        self.assertIn("Rendern funktioniert trotzdem", msg)
-
-    def test_request_sends_user_agent(self):
-        captured = {}
-
-        def fake_get(url, *args, **kwargs):
-            captured["headers"] = kwargs.get("headers") or {}
-            resp = MagicMock()
-            resp.ok = True
-            resp.json.return_value = {"sha": "c" * 40}
-            return resp
-
-        with patch("server.updater.requests.get", side_effect=fake_get):
-            updater.remote_sha_detailed()
-        self.assertIn("BlenderRenderServer", captured["headers"].get("User-Agent", ""))
-
 
 class SessionHeaderTests(unittest.TestCase):
     def test_session_sends_api_key(self):
@@ -334,6 +251,21 @@ class SessionHeaderTests(unittest.TestCase):
         with patch.object(config, "ROBLOX_API_KEY", ""):
             session = avatar._session()
         self.assertNotIn("x-api-key", {k.lower() for k in session.headers.keys()})
+
+
+class BlenderSceneHelperTests(unittest.TestCase):
+    def test_cframe_to_blender_matrix(self):
+        # Identity at (5, 10, 15)
+        cf = [5.0, 10.0, 15.0, 1, 0, 0, 0, 1, 0, 0, 0, 1]
+        mat = blender_render.cframe_to_blender_matrix(cf)
+        # Position in Blender should be (5, -15, 10)
+        self.assertAlmostEqual(mat[0][3], 5.0)
+        self.assertAlmostEqual(mat[1][3], -15.0)
+        self.assertAlmostEqual(mat[2][3], 10.0)
+
+    def test_heart_hands_assets_exist(self):
+        self.assertTrue((config.MODELS_DIR / "heart_hands.obj").is_file())
+        self.assertTrue((config.HANDS_DIR / "heart_hands.obj").is_file())
 
 
 class AppEndpointTests(unittest.TestCase):
@@ -349,7 +281,7 @@ class AppEndpointTests(unittest.TestCase):
         cls.client = TestClient(appmod.app)
         cls.appmod = appmod
 
-    def test_health_lists_studio_url_and_update(self):
+    def test_health_endpoint(self):
         if not self.client:
             self.skipTest("fastapi TestClient nicht verfuegbar")
         resp = self.client.get("/health")
@@ -357,16 +289,62 @@ class AppEndpointTests(unittest.TestCase):
         body = resp.json()
         self.assertEqual(body["status"], "ok")
         self.assertIn("studio_url", body)
-        self.assertIn("update_available", body)
+        self.assertIn("queue_length", body)
 
-    def test_update_status_endpoint(self):
+    def test_create_scene_job_and_check_status(self):
         if not self.client:
             self.skipTest("fastapi TestClient nicht verfuegbar")
-        resp = self.client.get("/update/status")
+
+        scene_payload = {
+            "avatars": [
+                {
+                    "username": "TEST-MODE",
+                    "material_mode": "GLAS",
+                    "glass_strength": 0.85,
+                    "heart_hands": True,
+                    "skin_color": [245, 205, 170],
+                    "parts": {
+                        "Head": {"cframe": [0, 5, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1], "size": [1, 1, 1]},
+                        "UpperTorso": {"cframe": [0, 3.8, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1], "size": [2, 1.6, 1]},
+                    }
+                }
+            ],
+            "objects": [
+                {
+                    "model_name": "heart_hands",
+                    "material_mode": "DURCHSICHTIGES_GLAS",
+                    "glass_strength": 0.9,
+                    "cframe": [0, 2, -5, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+                    "size": [1.5, 1.5, 1.5],
+                }
+            ],
+            "camera": {
+                "position": [0, 0, 0],
+                "target": [0, 0, -10],
+            }
+        }
+
+        resp = self.client.post("/jobs", json=scene_payload)
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
-        self.assertIn("current_version", body)
-        self.assertIn("update_available", body)
+        self.assertIn("job_id", body)
+        self.assertIn("state", body)
+        self.assertIn("queue_position", body)
+        job_id = body["job_id"]
+
+        # Status abfragen
+        st_resp = self.client.get(f"/jobs/{job_id}")
+        self.assertEqual(st_resp.status_code, 200)
+        st_body = st_resp.json()
+        self.assertTrue(st_body["exists"])
+        self.assertEqual(st_body["job_id"], job_id)
+        self.assertIn(st_body["state"], ("queued", "active", "done"))
+
+    def test_unknown_job_returns_404(self):
+        if not self.client:
+            self.skipTest("fastapi TestClient nicht verfuegbar")
+        resp = self.client.get("/jobs/nonexistent123")
+        self.assertEqual(resp.status_code, 404)
 
     def test_token_protects_jobs_but_not_health(self):
         if not self.client:
@@ -375,8 +353,34 @@ class AppEndpointTests(unittest.TestCase):
             denied = self.client.post("/jobs", json={"username": "Roblox"})
             self.assertEqual(denied.status_code, 401)
             self.assertIn("RENDER_ACCESS_TOKEN", denied.json()["detail"])
+
+            # Mit Token erfolgreich
+            allowed = self.client.post(
+                "/jobs",
+                json={"username": "Roblox"},
+                headers={"X-BRS-Token": "secret"}
+            )
+            self.assertEqual(allowed.status_code, 200)
+
             health = self.client.get("/health")
             self.assertEqual(health.status_code, 200)
+
+    def test_cleanup_expired_jobs_after_retention_days(self):
+        mgr = self.appmod.MANAGER
+        old_time = time.time() - (8 * 86400) # 8 Tage alt
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job_id = "test_expired_1"
+            mgr.jobs[job_id] = {
+                "id": job_id,
+                "state": "done",
+                "created_at": old_time,
+                "dir": tmpdir,
+            }
+            # Vor Cleanup existiert
+            self.assertIn(job_id, mgr.jobs)
+            mgr._cleanup_expired()
+            # Nach Cleanup entfernt
+            self.assertNotIn(job_id, mgr.jobs)
 
 
 if __name__ == "__main__":

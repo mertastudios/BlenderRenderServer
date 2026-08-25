@@ -2,64 +2,55 @@
 --  BlenderRenderServer – SERVER-SKRIPT (Roblox Studio)
 --------------------------------------------------------------------------------
 --  WO EINFUEGEN?
---    Im Studio-Explorer:  ServerScriptService  -> Rechtsklick -> Insert Object
---    -> "Script"  -> diesen Text komplett einfuegen (alten Inhalt loeschen)
+--    Im Studio-Explorer: ServerScriptService -> Rechtsklick -> Insert Object
+--    -> "Script" -> diesen Text einfuegen.
 --
---  VERHALTEN:
---    * Reiner Hintergrund-Dienst: startet den Render beim Spielstart automatisch
---    * Keine Benutzereingaben mehr (kein Button, keine Chat-Befehle)
---    * Schickt Status-Updates an alle Clients und streamt das fertige Bild
---    * Automatisches Reconnect-Handling bei Server-Updates & Neustarts
+--  FUNKTIONSWEISE:
+--    * Startet NICHT mehr automatisch beim Serverstart.
+--    * Erstellt eine BindableFunction namens "manage_render" in ServerStorage.
+--    * Aufruf aus beliebigen Server-Skripten ueber:
+--
+--        local ServerStorage = game:GetService("ServerStorage")
+--        local manage_render = ServerStorage:WaitForChild("manage_render")
+--
+--    * AKTIONEN:
+--        1) "Create", FolderImWorkspace
+--           -> Rueckgabe: success (bool), jobId_oder_Fehler (string)
+--
+--        2) "Status", jobId
+--           -> Rueckgabe: success (bool), statusTable_oder_Fehler (table/string)
+--              statusTable: { state = "queued"|"active"|"done"|"not_found",
+--                             queue_position = number,
+--                             est_seconds_left = number,
+--                             progress = number, message = string }
+--
+--        3) "Download", jobId
+--           -> Rueckgabe: success (bool), imageData_oder_Fehler (table/string)
+--              imageData: { width = 1024, height = 1024, size = Vector2, buffer = Buffer }
 --==============================================================================
 
-local HttpService       = game:GetService("HttpService")
-local AssetService      = game:GetService("AssetService")
-local Players           = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService    = game:GetService("HttpService")
+local ServerStorage  = game:GetService("ServerStorage")
 
 --========================= KONFIGURATION =====================================
-local RENDER_SERVER_URL   = "http://localhost:8000"
-local RENDER_ACCESS_TOKEN = "" -- Falls BRS_ACCESS_TOKEN in der .env gesetzt ist
-local DEFAULT_USERNAME    = "MertaStudios" -- Avatar, der beim Serverstart gerendert wird
-local POLL_SECONDS        = 2    -- Status-Abfrageintervall in Sekunden
-local HTTP_CHUNK_ROWS     = 16   -- Zeilen pro HTTP-Download
-local REMOTE_CHUNK_ROWS   = 8    -- Zeilen pro Client-Paket
-local AUTO_RENDER         = true -- Bei Spielstart sofort rendern
+local RENDER_SERVER_URL   = "http://localhost:8000" -- Adresse deines Render-Servers
+local RENDER_ACCESS_TOKEN = ""                      -- Sicherheits-Passwort (wie BRS_ACCESS_TOKEN in der .env)
+local HTTP_CHUNK_ROWS     = 16                      -- Bildzeilen pro HTTP-Paket beim Download
 --==============================================================================
 
--- Remotes in ReplicatedStorage anlegen
-local remoteImage = ReplicatedStorage:FindFirstChild("BlenderRender_Image")
-if not remoteImage then
-	remoteImage = Instance.new("RemoteEvent")
-	remoteImage.Name = "BlenderRender_Image"
-	remoteImage.Parent = ReplicatedStorage
-end
-
-local remoteStatus = ReplicatedStorage:FindFirstChild("BlenderRender_Status")
-if not remoteStatus then
-	remoteStatus = Instance.new("RemoteEvent")
-	remoteStatus.Name = "BlenderRender_Status"
-	remoteStatus.Parent = ReplicatedStorage
+--------------------------------------------------------------------------------
+-- BindableFunction in ServerStorage anlegen
+--------------------------------------------------------------------------------
+local manageRender = ServerStorage:FindFirstChild("manage_render")
+if not manageRender then
+	manageRender = Instance.new("BindableFunction")
+	manageRender.Name = "manage_render"
+	manageRender.Parent = ServerStorage
 end
 
 --------------------------------------------------------------------------------
--- Hilfsfunktionen & HTTP
+-- HTTP-Hilfsfunktionen
 --------------------------------------------------------------------------------
-
-local function broadcastStatus(step, totalSteps, stepName, message, progress, estSecondsLeft, state)
-	local payload = {
-		step = step or 1,
-		totalSteps = totalSteps or 5,
-		stepName = stepName or "In Bearbeitung",
-		message = message or "",
-		progress = progress or 0,
-		estSecondsLeft = estSecondsLeft or 0,
-		state = state or "active",
-	}
-	remoteStatus:FireAllClients(payload)
-	print(("[BlenderRender] [%d/%d] %s: %s (%d%% - Rest: ~%ds)"):format(
-		payload.step, payload.totalSteps, payload.stepName, payload.message, payload.progress, payload.estSecondsLeft))
-end
 
 local function httpRequest(method, path, bodyTable)
 	local ok, result = pcall(function()
@@ -94,201 +85,263 @@ local function asTable(body)
 	return nil
 end
 
-local function bufferSlice(src, byteOffset, byteLen)
-	local out = buffer.create(byteLen)
-	buffer.copy(out, 0, src, byteOffset, byteLen)
-	return out
-end
-
---------------------------------------------------------------------------------
--- Phase 1: Warten auf Render-Server
---------------------------------------------------------------------------------
-
-local function waitForServer()
-	while true do
-		local ok, code, body = httpRequest("GET", "/health")
-		local data = ok and asTable(body) or nil
-		if ok and data and data.status == "ok" then
-			local versionText = tostring(data.version or "1.2")
-			local updateText = data.update_available and " (Update verfuegbar)" or ""
-			broadcastStatus(1, 5, "Server verbunden",
-				("Render-Server ONLINE (Version %s%s)"):format(versionText, updateText), 5, 30, "active")
-			return data
-		end
-		broadcastStatus(1, 5, "Verbindung suchen",
-			("Warte auf Render-Server (HTTP %s). Starte 02_start.bat falls noetig ..."):format(tostring(code)), 2, 0, "waiting")
-		task.wait(POLL_SECONDS)
+local function colorToRgbTable(c)
+	if typeof(c) == "Color3" then
+		return { math.floor(c.R * 255), math.floor(c.G * 255), math.floor(c.B * 255) }
 	end
+	return { 245, 205, 170 }
 end
 
 --------------------------------------------------------------------------------
--- Phase 2: Auftrag abschicken
+-- 1. AKTION: "Create"
 --------------------------------------------------------------------------------
 
-local function submitJob(username)
-	local payload = {
-		username = username,
-	}
-	local ok, code, body = httpRequest("POST", "/jobs", payload)
-	local data = asTable(body)
-	if ok and data and data.job_id then
-		broadcastStatus(1, 5, "Auftrag angenommen",
-			("Auftrag fuer '%s' registriert (Job %s)"):format(username, data.job_id), 8, 28, "active")
-		return data.job_id
+local function serializeFolder(folder)
+	if not (typeof(folder) == "Instance") then
+		return nil, "Uebergebenes Objekt ist keine gueltige Roblox-Instanz (Folder/Model erwartet)."
 	end
-	broadcastStatus(1, 5, "Fehler beim Einreichen",
-		("Konnte Auftrag nicht senden (HTTP %s). Neuer Versuch ..."):format(tostring(code)), 0, 0, "error")
-	return nil
-end
 
---------------------------------------------------------------------------------
--- Phase 3: Status abfragen & Restzeit uebermitteln
---------------------------------------------------------------------------------
+	local avatars = {}
+	local objects = {}
 
-local function pollUntilDone(jobId)
-	while true do
-		local ok, code, body = httpRequest("GET", "/jobs/current")
-		if not ok then
-			-- Server aktualisiert sich moeglicherweise gerade selbst
-			broadcastStatus(0, 5, "Server aktualisiert / startet neu",
-				"Server antwortet kurzzeitig nicht (Auto-Update?). Warte auf Reconnect ...", 0, 0, "restarting")
-			task.wait(POLL_SECONDS)
-		else
-			local data = asTable(body)
-			if data == nil or data.state == "idle" then
-				broadcastStatus(1, 5, "Neustart erkannt", "Server hat neu gestartet -> reiche Auftrag neu ein ...", 5, 30, "resubmit")
-				return "resubmit"
-			elseif data.job_id == jobId then
-				local state = data.state
-				local step = data.step or 2
-				local totalSteps = data.step_total or 5
-				local stepName = data.step_name or state
-				local msg = data.message or ""
-				local progress = data.progress or 0
-				local estSec = data.est_seconds_left or 0
+	for _, item in ipairs(folder:GetChildren()) do
+		-- Pruefen, ob das Element ein Avatar-Rig ist
+		local isRig = item:GetAttribute("IsRig")
+		local username = item:GetAttribute("Username")
+		local hasHumanoid = item:FindFirstChildOfClass("Humanoid") or item:FindFirstChild("HumanoidRootPart")
 
-				if state == "done" then
-					broadcastStatus(5, 5, "Fertig gerendert", ("Render fuer '%s' erfolgreich abgeschlossen!"):format(data.username), 95, 2, "done")
-					return "done", data
-				elseif state == "error" then
-					broadcastStatus(0, 5, "Fehler aufgetreten", tostring(data.error or msg), 0, 0, "error")
-					return "error"
+		if isRig == true or username or hasHumanoid then
+			local finalUsername = username or item.Name
+			local matMode = item:GetAttribute("MaterialMode") or "GLAS"
+			local glassStrength = item:GetAttribute("GlassStrength") or 0.85
+			local heartHands = item:GetAttribute("HeartHands") or item:GetAttribute("SpecialHands") or false
+			
+			local skinCol = item:GetAttribute("SkinColor")
+			if not skinCol then
+				local head = item:FindFirstChild("Head") or item:FindFirstChild("LeftHand")
+				if head and head:IsA("BasePart") then
+					skinCol = colorToRgbTable(head.Color)
 				else
-					broadcastStatus(step, totalSteps, stepName, msg, progress, estSec, "active")
-					task.wait(POLL_SECONDS)
+					skinCol = { 245, 205, 170 }
 				end
-			else
-				task.wait(POLL_SECONDS)
+			elseif typeof(skinCol) == "Color3" then
+				skinCol = colorToRgbTable(skinCol)
 			end
+
+			-- Einzelne Koerperteile (R15 / R6) mit CFrames erfassen
+			local parts = {}
+			for _, part in ipairs(item:GetChildren()) do
+				if part:IsA("BasePart") then
+					local cf = part.CFrame
+					local col = part.Color
+					parts[part.Name] = {
+						cframe = { cf:GetComponents() },
+						position = { cf.Position.X, cf.Position.Y, cf.Position.Z },
+						size = { part.Size.X, part.Size.Y, part.Size.Z },
+						color = colorToRgbTable(col),
+					}
+				end
+			end
+
+			table.insert(avatars, {
+				username = finalUsername,
+				material_mode = tostring(matMode):upper(),
+				glass_strength = tonumber(glassStrength) or 0.85,
+				heart_hands = (heartHands == true),
+				skin_color = skinCol,
+				parts = parts,
+			})
+
+		elseif item:IsA("BasePart") or item:IsA("Model") then
+			-- Benutzerdefiniertes 3D-Modell / Part
+			local modelName = item:GetAttribute("ModelName") or item:GetAttribute("CustomModel") or item.Name
+			local matMode = item:GetAttribute("MaterialMode") or "MATT"
+			local glassStrength = item:GetAttribute("GlassStrength") or 0.85
+			
+			local cf = item:IsA("BasePart") and item.CFrame or (item.PrimaryPart and item.PrimaryPart.CFrame or CFrame.new())
+			local size = item:IsA("BasePart") and item.Size or (item:GetExtentsSize())
+			local color = item:IsA("BasePart") and colorToRgbTable(item.Color) or { 200, 200, 200 }
+
+			table.insert(objects, {
+				model_name = tostring(modelName),
+				name = item.Name,
+				material_mode = tostring(matMode):upper(),
+				glass_strength = tonumber(glassStrength) or 0.85,
+				cframe = { cf:GetComponents() },
+				size = { size.X, size.Y, size.Z },
+				color = color,
+			})
 		end
 	end
+
+	local sceneData = {
+		avatars = avatars,
+		objects = objects,
+		camera = {
+			position = { 0, 0, 0 },
+			target = { 0, 0, -10 },
+			fov = 32.0,
+		},
+	}
+
+	return sceneData, nil
+end
+
+local function handleCreate(folder)
+	local sceneData, err = serializeFolder(folder)
+	if not sceneData then
+		return false, tostring(err)
+	end
+
+	if #sceneData.avatars == 0 and #sceneData.objects == 0 then
+		return false, "Der Ordner enthaelt weder Avatare noch 3D-Modelle."
+	end
+
+	local ok, code, body = httpRequest("POST", "/jobs", sceneData)
+	if not ok then
+		return false, ("Verbindung zum Render-Server fehlgeschlagen (HTTP %s): %s"):format(tostring(code), tostring(body))
+	end
+
+	local data = asTable(body)
+	if data and data.job_id then
+		return true, data.job_id
+	end
+
+	return false, ("Server antwortete ohne gueltige Job-ID (HTTP %s): %s"):format(tostring(code), tostring(body))
 end
 
 --------------------------------------------------------------------------------
--- Phase 4: Bilduebertragung & Streaming
+-- 2. AKTION: "Status"
 --------------------------------------------------------------------------------
 
-local function transferImage(jobId)
-	local ok, code, body = httpRequest("GET", ("/jobs/%s/image/info"):format(jobId))
-	local info = ok and asTable(body) or nil
+local function handleStatus(jobId)
+	if not jobId or type(jobId) ~= "string" or #jobId == 0 then
+		return false, "Ungueltige Auftrag-ID uebergeben."
+	end
+
+	local ok, code, body = httpRequest("GET", "/jobs/" .. tostring(jobId))
+	if not ok then
+		if code == 404 then
+			return true, {
+				exists = false,
+				state = "not_found",
+				queue_position = 0,
+				est_seconds_left = 0,
+				message = "Auftrag existiert nicht (oder ist abgelaufen)",
+			}
+		end
+		return false, ("Verbindung zum Render-Server fehlgeschlagen (HTTP %s)"):format(tostring(code))
+	end
+
+	local data = asTable(body)
+	if not data then
+		return false, "Server-Antwort war kein gueltiges JSON."
+	end
+
+	local state = data.state or "unknown"
+	local result = {
+		exists = (data.exists ~= false),
+		job_id = data.job_id or jobId,
+		state = state,
+		queue_position = tonumber(data.queue_position) or 0,
+		est_seconds_left = tonumber(data.est_seconds_left) or 0,
+		progress = tonumber(data.progress) or 0,
+		message = data.message or state,
+		error = data.error,
+		width = data.width,
+		height = data.height,
+	}
+
+	return true, result
+end
+
+--------------------------------------------------------------------------------
+-- 3. AKTION: "Download"
+--------------------------------------------------------------------------------
+
+local function handleDownload(jobId)
+	if not jobId or type(jobId) ~= "string" or #jobId == 0 then
+		return false, "Ungueltige Auftrag-ID uebergeben."
+	end
+
+	-- 1. Bild-Dimensionen abfragen
+	local okInfo, codeInfo, bodyInfo = httpRequest("GET", ("/jobs/%s/image/info"):format(jobId))
+	if not okInfo then
+		return false, ("Bildinformationen nicht abrufbar (HTTP %s)"):format(tostring(codeInfo))
+	end
+
+	local info = asTable(bodyInfo)
 	if not (info and info.width and info.height) then
-		broadcastStatus(5, 5, "Fehler", "Bild-Metadaten nicht lesbar", 0, 0, "error")
-		return
-	end
-	local width, height = info.width, info.height
-	broadcastStatus(5, 5, "Bild uebertragen", ("Empfange %dx%d Pixel ..."):format(width, height), 95, 2, "transfer")
-
-	local serverImage = nil
-	pcall(function()
-		serverImage = AssetService:CreateEditableImage({ Size = Vector2.new(width, height) })
-	end)
-
-	-- Bild an alle aktuell verbundenen Clients streamen
-	local function getTargets()
-		return Players:GetPlayers()
+		return false, "Bild ist noch nicht fertig gerendert oder nicht vorhanden."
 	end
 
-	local totalChunks = math.ceil(height / HTTP_CHUNK_ROWS)
-	local chunkIndex, y = 0, 0
+	local width = tonumber(info.width) or 1024
+	local height = tonumber(info.height) or 1024
+	local totalBytes = width * height * 4
+	local fullBuffer = buffer.create(totalBytes)
 
+	-- 2. Pixelzeilen paketweise herunterladen (sicher gegen HTTP-Grenzen)
+	local y = 0
 	while y < height do
+		local rowsToFetch = math.min(HTTP_CHUNK_ROWS, height - y)
 		local okRow, codeRow, bodyRow = httpRequest("GET",
-			("/jobs/%s/image/rows?y=%d&rows=%d"):format(jobId, y, HTTP_CHUNK_ROWS))
+			("/jobs/%s/image/rows?y=%d&rows=%d"):format(jobId, y, rowsToFetch))
+
 		if not (okRow and codeRow == 200) then
-			broadcastStatus(5, 5, "Fehler", "Zeilen-Download fehlgeschlagen", 0, 0, "error")
-			return
+			return false, ("Fehler beim Herunterladen von Zeile %d (HTTP %s)"):format(y, tostring(codeRow))
 		end
 
-		local buf = buffer.fromstring(bodyRow)
-		local rowsInBuf = math.floor(buffer.len(buf) / (width * 4))
-		if rowsInBuf <= 0 then break end
+		local chunkBuf = buffer.fromstring(bodyRow)
+		local chunkLen = buffer.len(chunkBuf)
+		if chunkLen <= 0 then break end
 
-		if serverImage then
-			pcall(function()
-				serverImage:WritePixelsBuffer(Vector2.new(0, y), Vector2.new(width, rowsInBuf), buf)
-			end)
-		end
+		local offset = y * width * 4
+		local copyBytes = math.min(chunkLen, totalBytes - offset)
+		buffer.copy(fullBuffer, offset, chunkBuf, 0, copyBytes)
 
-		local targets = getTargets()
-		if #targets > 0 then
-			local y2 = y
-			while y2 < y + rowsInBuf do
-				local rows2 = math.min(REMOTE_CHUNK_ROWS, y + rowsInBuf - y2)
-				local offset = (y2 - y) * width * 4
-				local piece = bufferSlice(buf, offset, rows2 * width * 4)
-				for _, target in ipairs(targets) do
-					remoteImage:FireClient(target, "chunk", jobId, y2, rows2, width, height, piece)
-				end
-				y2 = y2 + rows2
-				task.wait()
-			end
-		end
-
-		chunkIndex = chunkIndex + 1
-		y = y + rowsInBuf
+		local rowsReceived = math.floor(chunkLen / (width * 4))
+		if rowsReceived <= 0 then rowsReceived = rowsToFetch end
+		y = y + rowsReceived
 	end
 
-	for _, target in ipairs(getTargets()) do
-		remoteImage:FireClient(target, "done", jobId, width, height)
-	end
-	broadcastStatus(5, 5, "Fertig!", ("Bild (%dx%d) erfolgreich im GUI angezeigt."):format(width, height), 100, 0, "done")
+	return true, {
+		width = width,
+		height = height,
+		size = Vector2.new(width, height),
+		buffer = fullBuffer,
+	}
 end
 
 --------------------------------------------------------------------------------
--- Pipeline-Steuerung
+-- BindableFunction Handler
 --------------------------------------------------------------------------------
 
-local isBusy = false
+manageRender.OnInvoke = function(action, ...)
+	local actionStr = tostring(action or ""):lower()
 
-local function runPipeline(username)
-	if isBusy then return end
-	isBusy = true
+	if actionStr == "create" then
+		local folder = ...
+		return handleCreate(folder)
 
-	while true do
-		waitForServer()
-		local jobId = submitJob(username)
-		if jobId then
-			local result = pollUntilDone(jobId)
-			if result == "done" then
-				transferImage(jobId)
-				break
-			elseif result == "error" then
-				break
-			end
-		else
-			task.wait(POLL_SECONDS)
-		end
+	elseif actionStr == "status" then
+		local jobId = ...
+		return handleStatus(jobId)
+
+	elseif actionStr == "download" then
+		local jobId = ...
+		return handleDownload(jobId)
+
+	else
+		return false, ("Unbekannte Aktion '%s'. Gueltig: 'Create', 'Status', 'Download'"):format(tostring(action))
 	end
-
-	isBusy = false
 end
 
 print("==============================================================")
-print("[BlenderRender] Server-Skript initialisiert (automatischer Render)!")
+print("[BlenderRender] manage_render BindableFunction in ServerStorage bereit!")
 print("[BlenderRender] Server-Adresse: " .. RENDER_SERVER_URL)
-print("[BlenderRender] Standard-User : " .. DEFAULT_USERNAME)
-print("==============================================================")
-
-if AUTO_RENDER then
-	task.spawn(runPipeline, DEFAULT_USERNAME)
+if #RENDER_ACCESS_TOKEN > 0 then
+	print("[BlenderRender] Authentifizierung: TOKEN AKTIV")
+else
+	print("[BlenderRender] Authentifizierung: Kein Token (offen)")
 end
+print("==============================================================")

@@ -90,7 +90,7 @@ BRS_ACCESS_TOKEN = get("BRS_ACCESS_TOKEN", "").strip()
 RENDER_WIDTH = min(get_int("RENDER_WIDTH", 1024), 1024)
 RENDER_HEIGHT = min(get_int("RENDER_HEIGHT", 1024), 1024)
 RENDER_SAMPLES = max(get_int("RENDER_SAMPLES", 96), 16)
-RENDER_MATERIAL = get("RENDER_MATERIAL", "glass").strip().lower()  # glass | original
+RENDER_MATERIAL = get("RENDER_MATERIAL", "glass").strip().lower()  # glass | matt | transparent_glass | original
 RENDER_DEVICE = get("RENDER_DEVICE", "CPU").strip().upper()        # CPU | GPU | AUTO
 # false = schoener Himmelshintergrund (empfohlen fuer Glas)
 # true  = transparenter Hintergrund (PNG mit Alpha)
@@ -100,6 +100,19 @@ RENDER_TRANSPARENT_BG = get_bool("RENDER_TRANSPARENT_BG", False)
 BLENDER_PATH = get("BLENDER_PATH", "").strip()
 # auto | subprocess | bpy   (bpy = Blender als Python-Pip-Modul, in-process)
 BLENDER_MODE = get("BLENDER_MODE", "auto").strip().lower()
+
+# ------------------------------------------------------------------------------
+#  Assets & Custom 3D Models
+# ------------------------------------------------------------------------------
+ASSETS_DIR = ROOT / "assets"
+MODELS_DIR = ASSETS_DIR / "models"
+HANDS_DIR = ASSETS_DIR / "hands"
+
+# ------------------------------------------------------------------------------
+#  Job Retention / Bereinigung (in Tagen, Standard: 7 Tage)
+# ------------------------------------------------------------------------------
+JOB_RETENTION_DAYS = max(get_int("JOB_RETENTION_DAYS", 7), 1)
+JOB_RETENTION_SECONDS = JOB_RETENTION_DAYS * 86400
 
 # ------------------------------------------------------------------------------
 #  Auto-Update
@@ -128,8 +141,16 @@ def version() -> str:
 
 
 def ensure_dirs() -> None:
-    for name in ("data", "data/jobs", "logs", ".update"):
-        (ROOT / name).mkdir(parents=True, exist_ok=True)
+    for p in (
+        ROOT / "data",
+        ROOT / "data" / "jobs",
+        ROOT / "logs",
+        ROOT / ".update",
+        ASSETS_DIR,
+        MODELS_DIR,
+        HANDS_DIR,
+    ):
+        p.mkdir(parents=True, exist_ok=True)
 
 
 def summary() -> dict:
@@ -142,4 +163,5 @@ def summary() -> dict:
         "test_mode": TEST_MODE,
         "public_url": PUBLIC_URL,
         "access_token_set": bool(BRS_ACCESS_TOKEN),
+        "retention_days": JOB_RETENTION_DAYS,
     }
